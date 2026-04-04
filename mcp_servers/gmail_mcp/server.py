@@ -13,7 +13,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-import httpx
 from fastapi import FastAPI, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -21,7 +20,6 @@ import draft_service
 import gmail_client
 import intent_detector
 import label_service
-import llm_client
 import supabase_ops
 import thread_service as thread_svc
 from auth import get_credentials
@@ -29,13 +27,8 @@ from config import settings
 from models import (
     ApplyLabelBody,
     ApproveBody,
-    AvailabilityRequestBody,
-    ClarificationRequestBody,
-    ConfirmationRequestBody,
     DiscardBody,
     DraftCreateRequest,
-    GenerateAvailabilityBody,
-    GenerateConfirmationBody,
     IntentDetectionRequest,
     LogRequest,
     MarkProcessedBody,
@@ -182,156 +175,45 @@ async def send_email(req: SendEmailRequest) -> Dict[str, Any]:
 
 
 @app.post("/send/availability-request", tags=["Email"])
-async def send_availability_request(body: AvailabilityRequestBody) -> Dict[str, Any]:
+async def send_availability_request(req: SendEmailRequest) -> Dict[str, Any]:
     """
-    Generate and send an availability request email to each participant.
+    Send a pre-written availability request email via Gmail.
 
-    Uses the LLM to generate a personalised email, then sends one copy
-    per participant and stores each in Supabase.
+    The caller (agent) is responsible for generating the subject and body_text.
+    This endpoint just sends whatever it receives — no LLM calls.
 
-    Body: {organizer, participants, meeting_title, session_id, thread_id, deadline_hours}
-    Returns: {status, emails_sent, message_ids}
+    Body: SendEmailRequest {to_emails, subject, body_text, session_id, thread_id, …}
+    Returns: {status, message_id, thread_id, email_id}
     """
-    try:
-        generated = llm_client.generate_availability_request_email(
-            organizer=body.organizer,
-            participants=body.participants,
-            meeting_title=body.meeting_title,
-            deadline_hours=body.deadline_hours,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"Email generation failed: {exc}")
-
-    message_ids: List[str] = []
-    for participant in body.participants:
-        req = SendEmailRequest(
-            to_emails=[participant],
-            subject=generated["subject"],
-            body_text=generated["body_text"],
-            body_html=generated.get("body_html"),
-            session_id=body.session_id,
-            thread_id=body.thread_id,
-        )
-        try:
-            result = gmail_client.send_email(req)
-            message_ids.append(result["message_id"])
-            # Store outbound record
-            import hashlib
-            from models import EmailRecord
-            now = _utcnow()
-            email_hash = hashlib.md5(
-                f"{result['message_id']}:{settings.CALSYNC_EMAIL}:{generated['subject']}".encode()
-            ).hexdigest()
-            record = EmailRecord(
-                message_id=result["message_id"],
-                thread_id=result["thread_id"],
-                session_id=body.session_id,
-                direction="OUTBOUND",
-                from_email=settings.CALSYNC_EMAIL,
-                to_emails=[participant],
-                subject=generated["subject"],
-                body_text=generated["body_text"],
-                body_html=generated.get("body_html"),
-                email_hash=email_hash,
-                is_read=True,
-                processing_status="DONE",
-                received_at=now,
-                ingested_at=now,
-                processed_at=now,
-            )
-            try:
-                supabase_ops.store_email(record)
-            except RuntimeError:
-                pass
-        except RuntimeError as exc:
-            logger.error("send_availability_request: failed for %s: %s", participant, exc)
-
-    return {
-        "status": "sent",
-        "emails_sent": len(message_ids),
-        "message_ids": message_ids,
-    }
+    return await send_email(req)
 
 
 @app.post("/send/confirmation", tags=["Email"])
-async def send_confirmation(body: ConfirmationRequestBody) -> Dict[str, Any]:
+async def send_confirmation(req: SendEmailRequest) -> Dict[str, Any]:
     """
-    Generate and send a booking confirmation email to all participants.
+    Send a pre-written booking confirmation email via Gmail.
 
-    Body: {participants, meeting_title, booked_slot, event_link, meet_link, session_id, …}
-    Returns: {status, emails_sent}
+    The caller (agent) is responsible for generating the subject and body_text.
+    This endpoint just sends whatever it receives — no LLM calls.
+
+    Body: SendEmailRequest {to_emails, subject, body_text, session_id, thread_id, …}
+    Returns: {status, message_id, thread_id, email_id}
     """
-    try:
-        generated = llm_client.generate_booking_confirmation_email(
-            participants=body.participants,
-            meeting_title=body.meeting_title,
-            booked_slot=body.booked_slot,
-            event_link=body.event_link,
-            meet_link=body.meet_link,
-            organizer_timezone=body.organizer_timezone,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"Confirmation generation failed: {exc}")
-
-    count = 0
-    for participant in body.participants:
-        req = SendEmailRequest(
-            to_emails=[participant],
-            subject=generated["subject"],
-            body_text=generated["body_text"],
-            body_html=generated.get("body_html"),
-            session_id=body.session_id,
-            thread_id=body.thread_id,
-        )
-        try:
-            gmail_client.send_email(req)
-            count += 1
-        except RuntimeError as exc:
-            logger.error("send_confirmation: failed for %s: %s", participant, exc)
-
-    supabase_ops.write_activity_log(
-        LogRequest(
-            session_id=body.session_id,
-            event_type="CONFIRMATION_SENT",
-            severity="SUCCESS",
-            description=f"Confirmation sent for '{body.meeting_title}' to {count} participant(s).",
-            actor="AGENT",
-        )
-    )
-
-    return {"status": "sent", "emails_sent": count}
+    return await send_email(req)
 
 
 @app.post("/send/clarification", tags=["Email"])
-async def send_clarification(body: ClarificationRequestBody) -> Dict[str, Any]:
+async def send_clarification(req: SendEmailRequest) -> Dict[str, Any]:
     """
-    Generate and send a clarification email to a participant.
+    Send a pre-written clarification email via Gmail.
 
-    Body: {participant, original_text, ambiguous_part, session_id, thread_id}
-    Returns: {status, message_id}
+    The caller (agent) is responsible for generating the subject and body_text.
+    This endpoint just sends whatever it receives — no LLM calls.
+
+    Body: SendEmailRequest {to_emails, subject, body_text, session_id, thread_id, …}
+    Returns: {status, message_id, thread_id, email_id}
     """
-    try:
-        generated = llm_client.generate_clarification_email(
-            participant=body.participant,
-            original_text=body.original_text,
-            ambiguous_part=body.ambiguous_part,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"Clarification generation failed: {exc}")
-
-    req = SendEmailRequest(
-        to_emails=[body.participant],
-        subject=generated["subject"],
-        body_text=generated["body_text"],
-        session_id=body.session_id,
-        thread_id=body.thread_id,
-    )
-    try:
-        result = gmail_client.send_email(req)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"Send failed: {exc}")
-
-    return {"status": "sent", "message_id": result["message_id"]}
+    return await send_email(req)
 
 
 # =============================================================================
@@ -369,7 +251,9 @@ async def get_thread(thread_id: str = Path(..., description="Gmail thread ID")):
 @app.post("/intent/detect", tags=["Thread"])
 async def detect_intent(req: IntentDetectionRequest):
     """
-    Classify the intent of an incoming email using keyword + LLM pipeline.
+    Classify the intent of an incoming email using pure keyword matching.
+
+    No LLM calls. Returns confidence=0.90 and reasoning='keyword match'.
 
     Body: IntentDetectionRequest {subject, body_text, thread_id}
     Returns: IntentDetectionResponse {intent, confidence, reasoning, extracted_data}
@@ -549,49 +433,7 @@ async def watch_status() -> Dict[str, Any]:
     return watch
 
 
-# =============================================================================
-# EMAIL GENERATION UTILITIES (preview — does NOT send)
-# =============================================================================
 
-
-@app.post("/generate/availability-request", tags=["Generate"])
-async def generate_availability_request(body: GenerateAvailabilityBody) -> Dict[str, Any]:
-    """
-    Generate an availability request email preview (does NOT send).
-
-    Body: {organizer, participants, meeting_title, deadline_hours}
-    Returns: {subject, body_text, body_html}
-    """
-    try:
-        return llm_client.generate_availability_request_email(
-            organizer=body.organizer,
-            participants=body.participants,
-            meeting_title=body.meeting_title,
-            deadline_hours=body.deadline_hours,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/generate/confirmation", tags=["Generate"])
-async def generate_confirmation(body: GenerateConfirmationBody) -> Dict[str, Any]:
-    """
-    Generate a booking confirmation email preview (does NOT send).
-
-    Body: {participants, meeting_title, booked_slot, event_link, meet_link, …}
-    Returns: {subject, body_text, body_html}
-    """
-    try:
-        return llm_client.generate_booking_confirmation_email(
-            participants=body.participants,
-            meeting_title=body.meeting_title,
-            booked_slot=body.booked_slot,
-            event_link=body.event_link,
-            meet_link=body.meet_link,
-            organizer_timezone=body.organizer_timezone,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # =============================================================================
@@ -602,24 +444,18 @@ async def generate_confirmation(body: GenerateConfirmationBody) -> Dict[str, Any
 @app.get("/health", tags=["Health"])
 async def health_check() -> Dict[str, Any]:
     """
-    Perform live health checks on all three external dependencies.
-
-    Checks:
-      - Supabase: executes a simple SELECT on app_settings.
-      - Ollama: HTTP GET to the Ollama server root.
-      - Gmail auth: calls get_credentials() and verifies validity.
+    Perform live health checks on Supabase and Gmail auth.
 
     Returns:
         {
           status: "ok" | "degraded",
           service: "gmail_mcp",
           port: 8006,
-          checks: {supabase: bool, ollama: bool, gmail_auth: bool}
+          checks: {supabase: bool, gmail_auth: bool}
         }
     """
     checks: Dict[str, bool] = {
         "supabase": False,
-        "ollama": False,
         "gmail_auth": False,
     }
 
@@ -629,14 +465,6 @@ async def health_check() -> Dict[str, Any]:
         checks["supabase"] = True
     except Exception as exc:
         logger.warning("Health: Supabase check failed: %s", exc)
-
-    # ── Ollama check ─────────────────────────────────────────────────────────
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(settings.OLLAMA_BASE_URL)
-            checks["ollama"] = resp.status_code == 200
-    except Exception as exc:
-        logger.warning("Health: Ollama check failed: %s", exc)
 
     # ── Gmail auth check ─────────────────────────────────────────────────────
     try:

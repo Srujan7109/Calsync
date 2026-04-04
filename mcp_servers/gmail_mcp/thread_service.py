@@ -1,7 +1,8 @@
 """
-thread_service.py — CalSync.ai Gmail MCP
+thread_service.py — CalSync.ai Gmail MCP (no LLM)
 
-Orchestrates Gmail thread fetching, Supabase storage, and AI summarisation.
+Orchestrates Gmail thread fetching and Supabase storage.
+No LLM calls — pure Gmail API + Supabase operations.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ from typing import List, Optional
 from gmail_client import get_thread
 from models import EmailRecord, ThreadResponse
 from supabase_ops import get_thread_emails, store_email
-import llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def _gmail_msg_to_email_record(
     Convert a parsed Gmail message dict into an EmailRecord for Supabase storage.
 
     Infers direction as INBOUND unless the from_email matches the CalSync
-    sender address (in which case it is OUTBOUND).
+    sender address (OUTBOUND).
 
     Args:
         msg: Parsed message dict from gmail_client.get_thread().
@@ -64,7 +64,6 @@ def _gmail_msg_to_email_record(
         else "INBOUND"
     )
 
-    # Convert internalDate (millis epoch) to ISO 8601 UTC
     internal_date = msg.get("internal_date") or msg.get("internalDate")
     if internal_date:
         try:
@@ -103,45 +102,22 @@ def _gmail_msg_to_email_record(
     )
 
 
-def generate_thread_summary(emails: List[dict]) -> str:
-    """
-    Generate a short AI summary of a list of email dicts.
-
-    Delegates to llm_client.summarise_thread() and wraps any failure
-    with a fallback string.
-
-    Args:
-        emails: List of parsed email message dicts.
-
-    Returns:
-        str: 2-3 sentence plain-English summary of the scheduling thread.
-    """
-    try:
-        return llm_client.summarise_thread(emails)
-    except Exception as exc:
-        logger.warning("generate_thread_summary failed: %s", exc)
-        return f"{len(emails)} email(s) in thread. Summary unavailable."
-
-
 def fetch_and_store_thread(
     thread_id: str, session_id: Optional[str] = None
 ) -> ThreadResponse:
     """
-    Fetch a Gmail thread, store all messages in Supabase, and summarise it.
+    Fetch a Gmail thread and store all messages in Supabase.
 
-    Steps:
-      1. Call gmail_client.get_thread() to retrieve all messages.
-      2. Convert each message to an EmailRecord and upsert into Supabase.
-      3. Generate an AI thread summary via llm_client.
-      4. Return a ThreadResponse with all emails and the summary.
+    Retrieves messages via the Gmail API, upserts each into Supabase,
+    and returns a ThreadResponse. No LLM calls — summary is always None.
 
     Args:
         thread_id: Gmail thread ID to fetch and store.
-        session_id: Optional scheduling session UUID to associate with the emails.
+        session_id: Optional scheduling session UUID to associate with emails.
 
     Returns:
-        ThreadResponse: Contains the thread_id, all stored EmailRecords,
-        count, and an AI-generated summary.
+        ThreadResponse: Contains thread_id, all stored EmailRecords, count,
+        and summary=None.
 
     Raises:
         RuntimeError: If the Gmail API call or Supabase write fails.
@@ -163,13 +139,11 @@ def fetch_and_store_thread(
             )
         email_records.append(record)
 
-    summary = generate_thread_summary(messages)
-
     return ThreadResponse(
         thread_id=thread_id,
         emails=email_records,
         count=len(email_records),
-        summary=summary,
+        summary=None,
     )
 
 
@@ -177,14 +151,11 @@ def get_thread_from_db(thread_id: str) -> ThreadResponse:
     """
     Retrieve all emails for a thread from Supabase (no Gmail API call).
 
-    Uses the locally stored data to build a ThreadResponse. Useful for
-    fast lookups after the thread has already been fetched and stored.
-
     Args:
         thread_id: Gmail thread ID to look up in Supabase.
 
     Returns:
-        ThreadResponse: Contains stored emails and a regenerated summary.
+        ThreadResponse: Contains stored emails with summary=None.
 
     Raises:
         RuntimeError: If the Supabase query fails.
@@ -192,22 +163,11 @@ def get_thread_from_db(thread_id: str) -> ThreadResponse:
     rows = get_thread_emails(thread_id)
     email_records = [EmailRecord(**row) for row in rows]
 
-    # Convert Supabase rows to the dict format expected by llm_client
-    email_dicts = [
-        {
-            "from_email": r.from_email,
-            "subject": r.subject,
-            "body_text": r.body_text,
-        }
-        for r in email_records
-    ]
-    summary = generate_thread_summary(email_dicts) if email_dicts else None
-
     return ThreadResponse(
         thread_id=thread_id,
         emails=email_records,
         count=len(email_records),
-        summary=summary,
+        summary=None,
     )
 
 
@@ -215,8 +175,7 @@ def detect_scheduling_keywords(subject: str, body: str) -> bool:
     """
     Fast keyword-based check to determine if an email is scheduling-related.
 
-    Runs in < 1ms — no LLM call. Acts as the first-pass edge filter before
-    running the more expensive LLM-based intent detection.
+    Runs in < 1ms — no LLM call.
 
     Args:
         subject: Email subject line.
@@ -226,27 +185,10 @@ def detect_scheduling_keywords(subject: str, body: str) -> bool:
         bool: True if any scheduling keyword is found; False otherwise.
     """
     KEYWORDS = {
-        "schedule",
-        "meeting",
-        "available",
-        "availability",
-        "sync",
-        "call",
-        "calendar",
-        "time",
-        "slot",
-        "discuss",
-        "standup",
-        "stand-up",
-        "touch base",
-        "catch up",
-        "invite",
-        "appointment",
-        "book",
-        "confirm",
-        "reschedule",
-        "cancel",
+        "schedule", "meeting", "available", "availability", "sync",
+        "call", "calendar", "time", "slot", "discuss", "standup",
+        "stand-up", "touch base", "catch up", "invite", "appointment",
+        "book", "confirm", "reschedule", "cancel",
     }
-    # Search subject + first 200 chars of body, case-insensitive
     combined = (subject + " " + body[:200]).lower()
     return any(kw in combined for kw in KEYWORDS)

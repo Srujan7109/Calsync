@@ -43,7 +43,7 @@ class Settings(BaseSettings):
 
     # ── CalSync Inbox ────────────────────────────────────────────────────────
     CALSYNC_EMAIL: str = Field(
-        default="calsync1.ai@gmail.com",
+        default="ameya.dusane05@gmail.com",
         description="The central CalSync.ai Gmail address",
     )
 
@@ -53,17 +53,8 @@ class Settings(BaseSettings):
         description="Google Cloud Pub/Sub topic for Gmail push notifications",
     )
 
-    # ── Ollama / LLM ─────────────────────────────────────────────────────────
-    OLLAMA_BASE_URL: str = Field(
-        default="http://localhost:11434",
-        description="Base URL of the Ollama inference server",
-    )
-    OLLAMA_MODEL: str = Field(
-        default="deepseek-r1:14b",
-        description="Ollama model name to use for LLM calls",
-    )
-
     # ── Server ───────────────────────────────────────────────────────────────
+
     PORT: int = Field(default=8006, description="Port for the FastAPI server")
     LOG_LEVEL: str = Field(
         default="INFO", description="Logging level (DEBUG/INFO/WARNING/ERROR)"

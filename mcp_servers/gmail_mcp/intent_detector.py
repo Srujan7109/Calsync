@@ -1,9 +1,8 @@
 """
-intent_detector.py — CalSync.ai Gmail MCP
+intent_detector.py — CalSync.ai Gmail MCP (no LLM)
 
-Orchestrates intent detection with a two-stage pipeline:
-  Stage 1: Fast keyword check (< 1ms, no LLM)
-  Stage 2: LLM classification via llm_client.detect_intent()
+Pure keyword-based intent classifier.
+No Ollama, no external calls — fast deterministic string matching only.
 """
 
 from __future__ import annotations
@@ -11,35 +10,102 @@ from __future__ import annotations
 import logging
 import re
 
-import llm_client
 from models import IntentDetectionRequest, IntentDetectionResponse
 from thread_service import detect_scheduling_keywords
 
 logger = logging.getLogger(__name__)
 
+# ── Keyword sets per intent ────────────────────────────────────────────────────
+
+_SCHEDULING_KEYWORDS = [
+    "schedule", "meeting", "set up", "arrange", "book", "sync",
+    "let's meet", "lets meet", "set a meeting", "plan a call",
+]
+
+_AVAILABILITY_KEYWORDS = [
+    "available", "free", "works for me", "can do", "how about",
+    "monday", "tuesday", "wednesday", "thursday", "friday",
+    "saturday", "sunday", "am free", "not free", "i'm free",
+    "works", "that works", "any time", "anytime", "open",
+    "i can do", "would work", "suits me", "prefer",
+]
+
+_STATUS_KEYWORDS = [
+    "status", "update", "booked", "confirmed", "scheduled yet",
+    "any update", "has it been", "did you", "have you",
+]
+
+_CANCELLATION_KEYWORDS = [
+    "cancel", "cancelling", "canceling", "cannot make it",
+    "can't make it", "wont be able", "won't be able", "unable to attend",
+    "need to cancel", "pulling out",
+]
+
+_RESCHEDULE_KEYWORDS = [
+    "reschedule", "move the meeting", "change the time", "different time",
+    "push the meeting", "postpone", "delay", "shift",
+]
+
+# Time patterns like 9am, 9:30am, 14:00, 2pm etc.
+_TIME_PATTERN = re.compile(
+    r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{1,2}:\d{2}\b",
+    re.IGNORECASE,
+)
+
+
+def _keyword_classify(subject: str, body_text: str) -> str:
+    """
+    Classify intent using ordered keyword matching.
+
+    Priority order: CANCELLATION → RESCHEDULE → AVAILABILITY_REPLY →
+    STATUS_QUERY → SCHEDULING_REQUEST → AMBIGUOUS
+
+    Args:
+        subject: Email subject line.
+        body_text: Plain-text email body.
+
+    Returns:
+        str: One of the IntentType literal values.
+    """
+    combined = (subject + " " + body_text).lower()
+
+    if any(kw in combined for kw in _CANCELLATION_KEYWORDS):
+        return "CANCELLATION_REQUEST"
+
+    if any(kw in combined for kw in _RESCHEDULE_KEYWORDS):
+        return "RESCHEDULE_REQUEST"
+
+    if any(kw in combined for kw in _STATUS_KEYWORDS):
+        return "STATUS_QUERY"
+
+    # AVAILABILITY_REPLY: needs at least 2 signals (a keyword + time/day OR two keywords)
+    av_hits = sum(1 for kw in _AVAILABILITY_KEYWORDS if kw in combined)
+    has_time = bool(_TIME_PATTERN.search(combined))
+    if av_hits >= 2 or (av_hits >= 1 and has_time):
+        return "AVAILABILITY_REPLY"
+
+    if any(kw in combined for kw in _SCHEDULING_KEYWORDS):
+        return "SCHEDULING_REQUEST"
+
+    return "AMBIGUOUS"
+
 
 def detect_email_intent(req: IntentDetectionRequest) -> IntentDetectionResponse:
     """
-    Classify the intent of an incoming email using a two-stage pipeline.
+    Classify the intent of an incoming email using pure keyword matching.
 
-    Stage 1 (fast): Run keyword detection on subject + body. If no
-    scheduling keywords are found, immediately return intent=OTHER
-    with high confidence — no LLM call needed.
-
-    Stage 2 (LLM): Call llm_client.detect_intent() to classify the
-    email and extract structured scheduling data.
+    No LLM calls. Two-stage guard:
+      Stage 1: quick scheduling keyword check — if none found, return OTHER.
+      Stage 2: ordered keyword classifier for specific intents.
 
     Args:
         req: IntentDetectionRequest with subject and body_text.
 
     Returns:
-        IntentDetectionResponse: Intent type, confidence, reasoning,
-        and any extracted scheduling data.
+        IntentDetectionResponse: {intent, confidence=0.90, reasoning, extracted_data=None}
     """
-    # Stage 1: keyword guard
-    has_keywords = detect_scheduling_keywords(req.subject, req.body_text)
-    if not has_keywords:
-        logger.debug("intent: no keywords found → returning OTHER")
+    # Stage 1: broad scheduling guard
+    if not detect_scheduling_keywords(req.subject, req.body_text):
         return IntentDetectionResponse(
             intent="OTHER",
             confidence=0.99,
@@ -47,32 +113,20 @@ def detect_email_intent(req: IntentDetectionRequest) -> IntentDetectionResponse:
             extracted_data=None,
         )
 
-    # Stage 2: LLM classification
-    try:
-        result = llm_client.detect_intent(req.subject, req.body_text)
-        return IntentDetectionResponse(
-            intent=result.get("intent", "AMBIGUOUS"),
-            confidence=float(result.get("confidence", 0.5)),
-            reasoning=result.get("reasoning", ""),
-            extracted_data=result.get("extracted_data"),
-        )
-    except Exception as exc:
-        logger.error("detect_email_intent LLM stage failed: %s", exc)
-        return IntentDetectionResponse(
-            intent="AMBIGUOUS",
-            confidence=0.0,
-            reasoning=f"LLM intent detection failed: {exc}",
-            extracted_data=None,
-        )
+    # Stage 2: specific intent classification
+    intent = _keyword_classify(req.subject, req.body_text)
+
+    return IntentDetectionResponse(
+        intent=intent,
+        confidence=0.90,
+        reasoning="keyword match",
+        extracted_data=None,
+    )
 
 
 def is_availability_reply(body_text: str) -> bool:
     """
     Quick heuristic check to determine if an email is an availability reply.
-
-    Detects common patterns like time expressions (9am, 14:00), day names,
-    and phrases like "I'm free", "works for me", etc. Used to shortcut the
-    LLM call when the reply is obviously an availability response.
 
     Args:
         body_text: Plain-text email body to analyse.
@@ -81,43 +135,15 @@ def is_availability_reply(body_text: str) -> bool:
         bool: True if the body matches common availability reply patterns.
     """
     text = body_text.lower()
+    has_time = bool(_TIME_PATTERN.search(text))
 
-    # Time patterns: 9am, 2pm, 14:00, 9:30am, etc.
-    time_pattern = re.compile(
-        r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{1,2}:\d{2}\b",
-        re.IGNORECASE,
-    )
-
-    # Day name patterns
     day_pattern = re.compile(
         r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
         r"mon|tue|wed|thu|fri|sat|sun)\b",
         re.IGNORECASE,
     )
-
-    # Availability phrases
-    availability_phrases = [
-        "free",
-        "available",
-        "works for me",
-        "can do",
-        "how about",
-        "i'm open",
-        "i am open",
-        "let's do",
-        "let me know",
-        "suits me",
-        "that works",
-        "sounds good",
-        "anytime",
-        "prefer",
-        "would work",
-    ]
-
-    has_time = bool(time_pattern.search(text))
     has_day = bool(day_pattern.search(text))
-    has_phrase = any(phrase in text for phrase in availability_phrases)
+    has_phrase = any(kw in text for kw in _AVAILABILITY_KEYWORDS)
 
-    # Must have at least two signals to be considered an availability reply
     signal_count = sum([has_time, has_day, has_phrase])
     return signal_count >= 2
