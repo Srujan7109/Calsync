@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -8,6 +9,9 @@ from app.config import get_settings
 from app.models.email_models import AgentProcessPayload
 from app.services.dedup_service import build_email_hash, check_and_mark_duplicate
 from app.services.imap_service import fetch_emails
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass(slots=True)
@@ -29,14 +33,24 @@ async def collect_imap_payloads(limit: int) -> ImapIngestionResult:
 
     for email_item in emails:
         email_hash = build_email_hash(email_item.sender, email_item.message_id)
+        body_preview = (email_item.body_text or "").replace("\n", " ").strip()[:300] or "No body content"
+
+        logger.info(
+            "📥 IMAP fetched from=%s subject=%s body_preview=%s",
+            email_item.sender,
+            email_item.subject,
+            body_preview,
+        )
 
         if await check_and_mark_duplicate(email_hash):
             duplicates += 1
+            logger.info("♻️ IMAP skipped duplicate message_id=%s", email_item.message_id)
             continue
 
         text_lower = f"{email_item.subject} {email_item.body_text[:200]}".lower()
         if not any(keyword in text_lower for keyword in settings.accepted_keywords):
             filtered_out += 1
+            logger.info("🧹 IMAP filtered by keywords subject=%s", email_item.subject)
             continue
 
         payloads.append(

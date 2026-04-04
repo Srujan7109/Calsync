@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
@@ -36,13 +37,19 @@ OPENAPI_TAGS = [
 ]
 
 
+logger = logging.getLogger("uvicorn.error")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings = get_settings()
     poller_task: asyncio.Task[None] | None = None
 
+    logger.info("Lifespan startup: imap_auto_poll_enabled=%s", settings.imap_auto_poll_enabled)
+
     if settings.imap_auto_poll_enabled:
         poller_task = asyncio.create_task(run_imap_poller())
+        logger.info("IMAP auto-poller task created")
 
     yield
 
