@@ -1,121 +1,178 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import './App.css'
+import { useEffect, Suspense, lazy, type ReactNode } from "react";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { supabase } from "./lib/supabase";
+import { useAuthStore } from "./stores/authstore.ts";
+import Sidebar from "./components/layout/Sidebar";
+import TopBar from "./components/layout/TopBar";
 
-function App() {
-  const [count, setCount] = useState(0)
+const Dashboard = lazy(() => import("./pages/Dashboard"));
+const SessionDetail = lazy(() => import("./pages/SessionDetail"));
+const Calendar = lazy(() => import("./pages/Calendar"));
+const EmailFeed = lazy(() => import("./pages/EmailFeed"));
+const Preferences = lazy(() => import("./pages/Preferences"));
+const Logs = lazy(() => import("./pages/Logs"));
+const Settings = lazy(() => import("./pages/Settings"));
+const Login = lazy(() => import("./pages/Login"));
+const NotFound = lazy(() => import("./pages/NotFound"));
 
+function FullPageMessage({ message }: { message: string }) {
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
-
-      <div className="ticks"></div>
-
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
-  )
+    <div className="min-h-screen flex items-center justify-center">
+      {message}
+    </div>
+  );
 }
 
-export default App
+function AuthGuard({ children }: { children: ReactNode }) {
+  const { user, isLoading } = useAuthStore();
+
+  if (isLoading) return <FullPageMessage message="Loading..." />;
+  if (!user) return <Navigate to="/login" replace />;
+
+  return <>{children}</>;
+}
+
+function AppLayout({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex h-screen overflow-hidden bg-[var(--color-bg)]">
+      <Sidebar />
+      <div className="flex-1 flex flex-col min-w-0">
+        <TopBar />
+        <main className="flex-1 overflow-y-auto p-4 md:p-6">
+          <Suspense fallback={<div className="p-6">Loading view...</div>}>
+            {children}
+          </Suspense>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const { setUser, setLoading } = useAuthStore();
+
+  useEffect(() => {
+    let active = true;
+
+    supabase.auth
+      .getSession()
+      .then(({ data: { session } }) => {
+        if (!active) return;
+        setUser(session?.user ?? null);
+      })
+      .finally(() => {
+        if (!active) return;
+        setLoading(false);
+      });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+      setLoading(false);
+    });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, [setUser, setLoading]);
+
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route
+          path="/login"
+          element={
+            <Suspense fallback={<div className="p-6">Loading...</div>}>
+              <Login />
+            </Suspense>
+          }
+        />
+
+        <Route
+          path="/"
+          element={
+            <AuthGuard>
+              <AppLayout>
+                <Dashboard />
+              </AppLayout>
+            </AuthGuard>
+          }
+        />
+        <Route
+          path="/sessions/:session_id"
+          element={
+            <AuthGuard>
+              <AppLayout>
+                <SessionDetail />
+              </AppLayout>
+            </AuthGuard>
+          }
+        />
+        <Route
+          path="/calendar"
+          element={
+            <AuthGuard>
+              <AppLayout>
+                <Calendar />
+              </AppLayout>
+            </AuthGuard>
+          }
+        />
+        <Route
+          path="/emails"
+          element={
+            <AuthGuard>
+              <AppLayout>
+                <EmailFeed />
+              </AppLayout>
+            </AuthGuard>
+          }
+        />
+        <Route
+          path="/preferences"
+          element={
+            <AuthGuard>
+              <AppLayout>
+                <Preferences />
+              </AppLayout>
+            </AuthGuard>
+          }
+        />
+        <Route
+          path="/logs"
+          element={
+            <AuthGuard>
+              <AppLayout>
+                <Logs />
+              </AppLayout>
+            </AuthGuard>
+          }
+        />
+        <Route
+          path="/settings"
+          element={
+            <AuthGuard>
+              <AppLayout>
+                <Settings />
+              </AppLayout>
+            </AuthGuard>
+          }
+        />
+        <Route
+          path="*"
+          element={
+            <AuthGuard>
+              <AppLayout>
+                <NotFound />
+              </AppLayout>
+            </AuthGuard>
+          }
+        />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+
+export default App;
