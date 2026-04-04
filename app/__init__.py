@@ -1,0 +1,1 @@
+"""Calsync FastAPI application package."""
