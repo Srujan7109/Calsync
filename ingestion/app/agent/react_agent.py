@@ -138,6 +138,7 @@ async def _analyze_email_with_gemini(payload: AgentProcessPayload) -> dict[str, 
         subject=payload.subject,
         from_email=payload.from_email,
         participants=", ".join(payload.participants),
+        current_time=datetime.now(timezone.utc).isoformat(),
         body=payload.body_text[:2000],
     )
     client = gemini_module.Client(api_key=settings.gemini_api_key)
@@ -240,7 +241,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
     ):
         reminder_body = (
             "Quick reminder to share your availability for this meeting thread. "
-            "Please reply with 2-3 concrete slots and timezone."
+            "Please reply with a time slot that works for you."
         )
         reminder_outcome = await tools.send_gmail_message(
             recipients=pending_participants,
@@ -280,7 +281,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
 
         if not calendar_slot["start"] or not calendar_slot["end"]:
             action = "SENT_AVAILABILITY_REQUEST"
-            request_body = "Please share 2-3 concrete slots with timezone so I can book the meeting."
+            request_body = "Please let me know a time slot with timezone so I can book the meeting."
             gmail_outcome = await tools.send_gmail_message(
                 recipients=participant_pool,
                 subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",

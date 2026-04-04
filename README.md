@@ -23,7 +23,9 @@ Monorepo for the Calsync email coordination platform.
 3. Install dependencies:
 
    ```powershell
-  pip install -r ingestion/requirements.txt
+   pip install -r ingestion/requirements.txt
+   pip install -r mcp_servers/gmail_mcp/requirements.txt
+   pip install -r mcp_servers/calendar_mcp/requirements.txt
    ```
 
 4. Optional dev dependencies:

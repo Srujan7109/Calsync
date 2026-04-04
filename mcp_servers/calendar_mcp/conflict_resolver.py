@@ -43,7 +43,6 @@ def check_slot_conflicts(
             "timeMin": slot.start,
             "timeMax": slot.end,
             "items": [{"id": p} for p in participants],
-            "timeZone": "UTC",
         }
         response = service.freebusy().query(body=body).execute()
         calendars = response.get("calendars", {})

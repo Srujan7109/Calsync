@@ -60,11 +60,9 @@ def build_event_body(
         "description": full_description,
         "start": {
             "dateTime": slot.start,
-            "timeZone": "UTC",
         },
         "end": {
             "dateTime": slot.end,
-            "timeZone": "UTC",
         },
         "attendees": [{"email": p} for p in participants],
         "conferenceData": {

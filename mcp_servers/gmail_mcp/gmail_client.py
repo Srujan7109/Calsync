@@ -116,6 +116,7 @@ def _build_mime(
     msg["Subject"] = req.subject
     msg["From"] = from_addr
     msg["To"] = ", ".join(req.to_emails)
+    msg["Reply-To"] = from_addr
     if req.cc_emails:
         msg["Cc"] = ", ".join(req.cc_emails)
     if req.in_reply_to:
