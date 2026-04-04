@@ -56,7 +56,8 @@ Calsync backend is an event ingestion and coordination engine designed to:
 ## Project Structure
 
 ```
-app/
+ingestion/
+└── app/
 ├── main.py                      # FastAPI app setup, lifespan management
 ├── config.py                    # Settings & environment loading
 ├── models/
@@ -185,13 +186,13 @@ ACCEPTED_KEYWORDS=schedule,meeting,call,sync,standup,discuss,touch base
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r ingestion/requirements.txt
 ```
 
 ### Run Locally
 
-```bash
-uvicorn app.main:app --reload
+```powershell
+uvicorn ingestion.app.main:app --reload --port 8000
 ```
 
 ### Access Documentation

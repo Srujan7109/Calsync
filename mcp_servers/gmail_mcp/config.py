@@ -7,14 +7,18 @@ Import `settings` from this module everywhere config is needed.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import AliasChoices, Field
+from pathlib import Path
+
+
+MODULE_DIR = Path(__file__).resolve().parent
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables or .env file."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(MODULE_DIR / ".env"),
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore",
@@ -23,12 +27,14 @@ class Settings(BaseSettings):
     # ── Supabase ────────────────────────────────────────────────────────────
     SUPABASE_URL: str = Field(..., description="Supabase project URL")
     SUPABASE_SERVICE_ROLE_KEY: str = Field(
-        ..., description="Supabase service role key — bypasses RLS"
+        ...,
+        description="Supabase service role key — bypasses RLS",
+        validation_alias=AliasChoices("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SERVICE_KEY"),
     )
 
     # ── Google OAuth 2.0 ─────────────────────────────────────────────────────
     GOOGLE_CREDENTIALS_JSON: str = Field(
-        default="./credentials.json",
+        default=str(MODULE_DIR / "credentials.json"),
         description="Path to Google Desktop-app credentials.json",
     )
     GOOGLE_REFRESH_TOKEN: str = Field(

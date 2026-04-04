@@ -7,7 +7,7 @@ from email.header import decode_header
 from email.message import Message
 from typing import Iterable
 
-from app.config import Settings
+from ingestion.app.config import Settings
 
 
 @dataclass(slots=True)

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
-from app.models.email_models import ImapPollResponse
-from app.services.background_tasks import process_email_task
-from app.services.imap_ingestion import collect_imap_payloads
+from ingestion.app.models.email_models import ImapPollResponse
+from ingestion.app.services.background_tasks import process_email_task
+from ingestion.app.services.imap_ingestion import collect_imap_payloads
 
 
 router = APIRouter(prefix="/api/v1/imap", tags=["imap"])

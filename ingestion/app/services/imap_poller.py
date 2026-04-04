@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.config import get_settings
-from app.services.background_tasks import process_email_task
-from app.services.imap_ingestion import collect_imap_payloads
+from ingestion.app.config import get_settings
+from ingestion.app.services.background_tasks import process_email_task
+from ingestion.app.services.imap_ingestion import collect_imap_payloads
 
 
 logger = logging.getLogger("uvicorn.error")

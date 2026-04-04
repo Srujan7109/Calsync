@@ -9,12 +9,18 @@ rescheduling, force-book, RSVP sync, and health check.
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path as FilePath
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
+
+MODULE_DIR = FilePath(__file__).resolve().parent
+if str(MODULE_DIR) not in sys.path:
+    sys.path.append(str(MODULE_DIR))
 
 import calendar_client
 import conflict_resolver

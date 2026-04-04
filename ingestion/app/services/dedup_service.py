@@ -6,7 +6,7 @@ from importlib import import_module
 
 import httpx
 
-from app.config import get_settings
+from ingestion.app.config import get_settings
 
 
 _memory_store: dict[str, datetime] = {}

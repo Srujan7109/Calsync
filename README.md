@@ -1,6 +1,10 @@
 # Calsync
 
-FastAPI backend for the Calsync email coordination agent.
+Monorepo for the Calsync email coordination platform.
+
+- `ingestion/`: FastAPI ingestion and Gemini orchestration service (port 8000)
+- `mcp_servers/gmail_mcp/`: Gmail MCP service (port 8006)
+- `mcp_servers/calendar_mcp/`: Calendar MCP service (port 8002)
 
 ## Setup (Windows PowerShell)
 
@@ -19,13 +23,19 @@ FastAPI backend for the Calsync email coordination agent.
 3. Install dependencies:
 
    ```powershell
-   pip install -r requirements.txt
+  pip install -r ingestion/requirements.txt
    ```
+
+4. Optional dev dependencies:
+
+  ```powershell
+  pip install -r requirements-dev.txt
+  ```
 
 ## Run locally
 
-```bash
-uvicorn app.main:app --reload
+```powershell
+uvicorn ingestion.app.main:app --reload --port 8000
 ```
 
 ## Agent configuration (Gemini + MCP)
@@ -37,8 +47,9 @@ Set these in `.env` for the coordination agent:
 - `GMAIL_MCP_URL` (base URL for Gmail API MCP server)
 - `GMAIL_SENDER_EMAIL` (optional sender identity)
 - `CALENDAR_MCP_URL` (base URL for Calendar API MCP server)
-- `GMAIL_MCP_SEND_PATH` (optional, default: `/mcp/gmail/send`)
-- `CALENDAR_MCP_BOOK_PATH` (optional, default: `/mcp/calendar/book`)
+- `GMAIL_MCP_SEND_PATH` (optional, default: `/send`)
+- `CALENDAR_MCP_BOOK_PATH` (optional, default: `/book`)
+- `CALENDAR_MCP_FREEBUSY_PATH` (optional, default: `/freebusy`)
 
 Use `.env.example` as the handoff template for teammates.
 
@@ -52,12 +63,11 @@ Calsync sends `POST {GMAIL_MCP_URL}{GMAIL_MCP_SEND_PATH}` with JSON:
 
 ```json
 {
-  "action": "SEND_EMAIL",
-  "from": "calsync1.ai@gmail.com",
-  "to": ["alice@example.com", "bob@example.com"],
+  "to_emails": ["alice@example.com", "bob@example.com"],
   "subject": "Re: Meeting",
   "body_text": "Could you please share your preferred time slots and timezone?",
-  "thread_id": "thread_abc123"
+  "thread_id": "thread_abc123",
+  "session_id": "sess_xyz789"
 }
 ```
 
@@ -68,7 +78,16 @@ Expected behavior:
 
 ### 2) Calendar MCP contract
 
-Calsync sends `POST {CALENDAR_MCP_URL}{CALENDAR_MCP_BOOK_PATH}` with JSON:
+Calsync first sends `POST {CALENDAR_MCP_URL}{CALENDAR_MCP_FREEBUSY_PATH}`:
+
+```json
+{
+  "participants": ["alice@example.com", "bob@example.com"],
+  "slots": [{ "start": "2026-04-05T10:00:00Z", "end": "2026-04-05T10:30:00Z" }]
+}
+```
+
+Then Calsync sends `POST {CALENDAR_MCP_URL}{CALENDAR_MCP_BOOK_PATH}`:
 
 ```json
 {
@@ -76,12 +95,13 @@ Calsync sends `POST {CALENDAR_MCP_URL}{CALENDAR_MCP_BOOK_PATH}` with JSON:
   "title": "Team Sync",
   "slot": {
     "start": "2026-04-05T10:00:00Z",
-    "end": "2026-04-05T10:30:00Z",
-    "timezone": "UTC"
+    "end": "2026-04-05T10:30:00Z"
   },
   "participants": ["alice@example.com", "bob@example.com"],
+  "organizer_email": "alice@example.com",
   "description": "Coordinated by CalSync.ai",
-  "fallback_slots": []
+  "fallback_slots": [],
+  "session_id": "sess_xyz789"
 }
 ```
 
@@ -93,15 +113,17 @@ Expected behavior:
 ### 3) Quick integration check
 
 1. Copy `.env.example` to `.env` and fill Gemini + MCP values.
-2. Start server with `uvicorn app.main:app --reload`.
-3. Trigger agent endpoint (`POST /api/v1/agent/process`) from Postman collection.
+2. Start ingestion server with `uvicorn ingestion.app.main:app --reload --port 8000`.
+3. Start Gmail MCP with `uvicorn mcp_servers.gmail_mcp.server:app --reload --port 8006`.
+4. Start Calendar MCP with `uvicorn mcp_servers.calendar_mcp.server:app --reload --port 8002`.
+5. Trigger agent endpoint (`POST /api/v1/agent/process`) from Postman collection.
 4. Confirm logs include:
    - `Agent decision source=gemini ... action=...`
    - tool outcomes in reasoning trace (`send_gmail_message=OK`, `book_calendar=OK`)
 
 ## API Docs (Swagger)
 
-After server startup:
+After ingestion server startup:
 
 - Swagger UI: `http://127.0.0.1:8000/docs`
 - ReDoc: `http://127.0.0.1:8000/redoc`
@@ -164,7 +186,7 @@ When auto polling is enabled, the server checks IMAP every 10 seconds in the bac
 
 Trigger poll:
 
-```bash
+```powershell
 curl -X POST "http://127.0.0.1:8000/api/v1/imap/poll?limit=20"
 ```
 

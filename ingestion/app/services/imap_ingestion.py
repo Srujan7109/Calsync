@@ -5,10 +5,11 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from app.config import get_settings
-from app.models.email_models import AgentProcessPayload
-from app.services.dedup_service import build_email_hash, check_and_mark_duplicate
-from app.services.imap_service import fetch_emails
+from ingestion.app.config import get_settings
+from ingestion.app.models.email_models import AgentProcessPayload
+from ingestion.app.services.participant_utils import dedupe_emails, exclude_emails, parse_email_addresses
+from ingestion.app.services.dedup_service import build_email_hash, check_and_mark_duplicate
+from ingestion.app.services.imap_service import fetch_emails
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -60,6 +61,13 @@ async def collect_imap_payloads(limit: int) -> ImapIngestionResult:
                 from_email=email_item.sender,
                 subject=email_item.subject,
                 body_text=email_item.body_text,
+                thread_id=email_item.message_id,
+                participants=exclude_emails(
+                    dedupe_emails(
+                        parse_email_addresses(email_item.to) + parse_email_addresses(email_item.sender)
+                    ),
+                    [settings.gmail_sender_email or "", settings.imap_username or ""],
+                ),
                 received_at=datetime.now(timezone.utc).isoformat(),
             )
         )

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.agent.react_agent import run_react_agent
-from app.models.agent_models import AgentProcessResponse
-from app.models.email_models import AgentProcessPayload
+from ingestion.app.agent.react_agent import run_react_agent
+from ingestion.app.models.agent_models import AgentProcessResponse
+from ingestion.app.models.email_models import AgentProcessPayload
 
 
 router = APIRouter(prefix="/api/v1/agent", tags=["agent"])

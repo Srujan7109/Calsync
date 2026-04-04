@@ -5,16 +5,17 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, UploadFile
 
-from app.config import get_settings
-from app.models.email_models import (
+from ingestion.app.config import get_settings
+from ingestion.app.models.email_models import (
     AgentProcessPayload,
     DuplicateResponse,
     EmailWebhookPayload,
     NotSchedulingResponse,
     WebhookAcceptedResponse,
 )
-from app.services.background_tasks import process_email_task
-from app.services.dedup_service import build_email_hash, check_and_mark_duplicate
+from ingestion.app.services.participant_utils import dedupe_emails, exclude_emails, parse_email_addresses
+from ingestion.app.services.background_tasks import process_email_task
+from ingestion.app.services.dedup_service import build_email_hash, check_and_mark_duplicate
 
 
 router = APIRouter(prefix="/api/v1/webhook", tags=["webhook"])
@@ -84,12 +85,18 @@ async def receive_email(
         return NotSchedulingResponse()
 
     task_id = f"bg_task_{uuid.uuid4().hex[:8]}"
+    participants = dedupe_emails(parse_email_addresses(payload.to) + parse_email_addresses(payload.sender))
+    participants = exclude_emails(participants, [settings.gmail_sender_email or ""])
+    thread_id = payload.message_id.strip()
+
     background_payload = AgentProcessPayload(
         email_hash=email_hash,
         message_id=payload.message_id,
         from_email=payload.sender,
         subject=payload.subject,
         body_text=payload.text,
+        thread_id=thread_id,
+        participants=participants,
         received_at=datetime.now(timezone.utc).isoformat(),
     )
     background_tasks.add_task(process_email_task, background_payload.model_dump())

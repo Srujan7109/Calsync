@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
     dedup_ttl_seconds: int = 24 * 60 * 60
     accepted_keywords: list[str] = Field(
-        default_factory=lambda: ["meeting", "schedule", "available", "call", "sync", "time", "slot"]
+        default_factory=lambda: ["meeting", "schedule", "available", "call", "sync", "time", "slot", "meet"]
     )
     dedup_backend: Literal["auto", "redis", "supabase", "memory"] = "auto"
     redis_url: str | None = None
@@ -31,12 +31,15 @@ class Settings(BaseSettings):
 
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-1.5-flash"
+    thread_intelligence_enabled: bool = True
+    reminder_cooldown_minutes: int = 120
 
     gmail_sender_email: str | None = None
     gmail_mcp_url: str | None = None
-    gmail_mcp_send_path: str = "/mcp/gmail/send"
+    gmail_mcp_send_path: str = "/send"
     calendar_mcp_url: str | None = None
-    calendar_mcp_book_path: str = "/mcp/calendar/book"
+    calendar_mcp_book_path: str = "/book"
+    calendar_mcp_freebusy_path: str = "/freebusy"
 
 
 @lru_cache

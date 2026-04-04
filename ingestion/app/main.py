@@ -4,11 +4,11 @@ from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
-from app.config import get_settings
-from app.routers.agent import router as agent_router
-from app.routers.imap import router as imap_router
-from app.routers.webhook import router as webhook_router
-from app.services.imap_poller import run_imap_poller
+from ingestion.app.config import get_settings
+from ingestion.app.routers.agent import router as agent_router
+from ingestion.app.routers.imap import router as imap_router
+from ingestion.app.routers.webhook import router as webhook_router
+from ingestion.app.services.imap_poller import run_imap_poller
 
 
 APP_DESCRIPTION = """

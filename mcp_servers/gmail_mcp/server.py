@@ -9,12 +9,18 @@ draft management, label operations, Gmail watch, and utilities.
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path as FilePath
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
+
+MODULE_DIR = FilePath(__file__).resolve().parent
+if str(MODULE_DIR) not in sys.path:
+    sys.path.append(str(MODULE_DIR))
 
 import draft_service
 import gmail_client
