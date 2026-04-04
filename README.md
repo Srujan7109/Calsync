@@ -36,6 +36,45 @@ After server startup:
 - ReDoc: `http://127.0.0.1:8000/redoc`
 - OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`
 
+## Internal Agent API (for frontend and DB teams)
+
+Endpoint:
+
+- `POST /api/v1/agent/process`
+
+Request JSON:
+
+```json
+{
+   "email_hash": "sha256-hex-string",
+   "message_id": "<CABc123@mail.gmail.com>",
+   "from_email": "alice@example.com",
+   "subject": "Schedule a team meeting next week",
+   "body_text": "Hi CalSync, I am available Monday 2-5pm...",
+   "thread_id": "thread_abc123",
+   "participants": ["alice@example.com", "bob@example.com"],
+   "received_at": "2025-01-01T09:00:00Z"
+}
+```
+
+Response JSON:
+
+```json
+{
+   "agent_result": {
+      "action_taken": "SENT_AVAILABILITY_REQUEST",
+      "session_id": "sess_xyz789",
+      "emails_sent_to": ["bob@example.com"],
+      "reasoning_trace": "Thought: New meeting request... Action: create_session..."
+   }
+}
+```
+
+Notes:
+
+- This endpoint is internal and can be called by background workers.
+- It is also available in Swagger for frontend and DB contract testing.
+
 ## IMAP ingestion (new primary path)
 
 Set these in `.env` before polling:

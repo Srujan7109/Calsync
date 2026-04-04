@@ -1,0 +1,419 @@
+{
+  "info": {
+    "_postman_id": "f2af12f1-9f95-4f47-9bb1-58be995bc3e9",
+    "name": "Calsync API",
+    "description": "Postman collection for the Calsync FastAPI backend, including webhook ingress, IMAP polling, and the internal LangChain agent contract.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Agent",
+      "item": [
+        {
+          "name": "Process Email Through Agent",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email_hash\": \"sha256-hex-string\",\n  \"message_id\": \"<CABc123@mail.gmail.com>\",\n  \"from_email\": \"alice@example.com\",\n  \"subject\": \"Schedule a team meeting next week\",\n  \"body_text\": \"Hi CalSync, I am available Monday 2-5pm...\",\n  \"thread_id\": \"thread_abc123\",\n  \"participants\": [\"alice@example.com\", \"bob@example.com\"],\n  \"received_at\": \"2025-01-01T09:00:00Z\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/agent/process",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "agent",
+                "process"
+              ]
+            },
+            "description": "Internal agent endpoint used by background workers and frontend contract testing."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/api/v1/agent/process",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "v1",
+                    "agent",
+                    "process"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"agent_result\": {\n    \"action_taken\": \"SENT_AVAILABILITY_REQUEST\",\n    \"session_id\": \"sess_xyz789\",\n    \"emails_sent_to\": [\"bob@example.com\"],\n    \"reasoning_trace\": \"Thought: New meeting request... Action: create_session...\"\n  }\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Webhook",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/webhook/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "webhook",
+                "health"
+              ]
+            },
+            "description": "Returns webhook ingress health status."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/v1/webhook/health",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "v1",
+                    "webhook",
+                    "health"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"ok\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Receive Inbound Email",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "from",
+                  "value": "alice@example.com",
+                  "type": "text",
+                  "description": "Sender email address"
+                },
+                {
+                  "key": "to",
+                  "value": "calsync@yourdomain.com",
+                  "type": "text",
+                  "description": "Recipient mailbox address"
+                },
+                {
+                  "key": "subject",
+                  "value": "Schedule a team sync",
+                  "type": "text",
+                  "description": "Email subject"
+                },
+                {
+                  "key": "text",
+                  "value": "Can we schedule a call next Tuesday at 3 PM?",
+                  "type": "text",
+                  "description": "Plain text email body"
+                },
+                {
+                  "key": "html",
+                  "value": "<p>Can we schedule a call next Tuesday at 3 PM?</p>",
+                  "type": "text",
+                  "description": "Optional HTML email body",
+                  "disabled": true
+                },
+                {
+                  "key": "message_id",
+                  "value": "<CABc123@mail.gmail.com>",
+                  "type": "text",
+                  "description": "Unique message id used in dedup hash"
+                },
+                {
+                  "key": "headers",
+                  "value": "X-Mailer: Example",
+                  "type": "text",
+                  "description": "Optional raw headers",
+                  "disabled": true
+                },
+                {
+                  "key": "spam_score",
+                  "value": "0.1",
+                  "type": "text",
+                  "description": "Optional provider spam score",
+                  "disabled": true
+                },
+                {
+                  "key": "attachments",
+                  "type": "file",
+                  "src": "",
+                  "description": "Optional file attachments",
+                  "disabled": true
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/webhook/email",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "webhook",
+                "email"
+              ]
+            },
+            "description": "Accepts SendGrid-style multipart form data, deduplicates by from+message_id, filters non-scheduling emails, and queues processing."
+          },
+          "response": [
+            {
+              "name": "Accepted",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/v1/webhook/email",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "v1",
+                    "webhook",
+                    "email"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"accepted\",\n  \"task_id\": \"bg_task_abc123\"\n}"
+            },
+            {
+              "name": "Duplicate",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/v1/webhook/email",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "v1",
+                    "webhook",
+                    "email"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"duplicate_discarded\"\n}"
+            },
+            {
+              "name": "Not Scheduling Related",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/v1/webhook/email",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "v1",
+                    "webhook",
+                    "email"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"not_scheduling_related\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "IMAP",
+      "item": [
+        {
+          "name": "Poll IMAP Inbox",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/imap/poll?limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "imap",
+                "poll"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "description": "Number of emails to fetch (1-100)"
+                }
+              ]
+            },
+            "description": "Fetches emails from configured IMAP mailbox, deduplicates, filters, and queues accepted emails."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/v1/imap/poll?limit=20",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "v1",
+                    "imap",
+                    "poll"
+                  ],
+                  "query": [
+                    {
+                      "key": "limit",
+                      "value": "20"
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"ok\",\n  \"fetched\": 20,\n  \"accepted\": 3,\n  \"duplicates\": 14,\n  \"filtered_out\": 3\n}"
+            },
+            {
+              "name": "400 Bad Request",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/v1/imap/poll?limit=20",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "v1",
+                    "imap",
+                    "poll"
+                  ],
+                  "query": [
+                    {
+                      "key": "limit",
+                      "value": "20"
+                    }
+                  ]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"IMAP credentials are incomplete.\"\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

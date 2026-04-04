@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 
 from app.config import get_settings
+from app.routers.agent import router as agent_router
 from app.routers.imap import router as imap_router
 from app.routers.webhook import router as webhook_router
 from app.services.imap_poller import run_imap_poller
@@ -20,6 +21,10 @@ Core capabilities:
 """
 
 OPENAPI_TAGS = [
+    {
+        "name": "agent",
+        "description": "Internal orchestration endpoints used by async background processing and integrators.",
+    },
     {
         "name": "webhook",
         "description": "Inbound email webhook endpoints (SendGrid-style multipart payloads).",
@@ -58,6 +63,7 @@ def create_app() -> FastAPI:
         openapi_tags=OPENAPI_TAGS,
         lifespan=lifespan,
     )
+    app.include_router(agent_router)
     app.include_router(webhook_router)
     app.include_router(imap_router)
     return app

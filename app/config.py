@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     imap_poll_batch_size: int = 20
     imap_auto_poll_enabled: bool = True
 
+    langchain_enabled: bool = True
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+
+    compute_mcp_url: str | None = None
+    state_mcp_url: str | None = None
+    calendar_mcp_url: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:
