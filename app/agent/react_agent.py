@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import uuid
 from importlib import import_module
+from typing import Any
 
-from app.agent.prompts import SYSTEM_PROMPT
+from app.agent.prompts import AGENT_ANALYSIS_PROMPT
 from app.agent.tools import CalsyncTools
 from app.config import get_settings
 from app.models.agent_models import AgentProcessResponse, AgentResult
 from app.models.email_models import AgentProcessPayload
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def _looks_like_new_meeting(subject: str, body_text: str) -> bool:
@@ -15,76 +22,153 @@ def _looks_like_new_meeting(subject: str, body_text: str) -> bool:
     return any(word in text for word in ["meeting", "schedule", "available", "sync", "call"])
 
 
-async def _optional_llm_trace(payload: AgentProcessPayload, tool_status: str) -> str:
-    settings = get_settings()
-    if not settings.langchain_enabled:
-        return (
-            "Thought: Analyze inbound email for scheduling intent. "
-            f"Action: tool_pipeline({tool_status}). Observation: queued state update and follow-up."
-        )
+def _extract_json_payload(raw_text: str) -> dict[str, Any] | None:
+    left = raw_text.find("{")
+    right = raw_text.rfind("}")
+    if left < 0 or right < left:
+        return None
+    try:
+        return json.loads(raw_text[left : right + 1])
+    except json.JSONDecodeError:
+        return None
 
-    if not settings.openai_api_key:
-        return (
-            "Thought: LLM disabled due to missing OPENAI_API_KEY. "
-            f"Action: deterministic pipeline({tool_status})."
+
+async def _analyze_email_with_gemini(payload: AgentProcessPayload) -> dict[str, Any]:
+    settings = get_settings()
+    default_action = "SENT_AVAILABILITY_REQUEST" if _looks_like_new_meeting(payload.subject, payload.body_text) else "NO_ACTION"
+    default_reasoning = "Thought: deterministic scheduling intent check. Action: fallback pipeline."
+
+    if not settings.gemini_api_key:
+        logger.info(
+            "Agent decision source=fallback reason=missing_gemini_api_key subject=%s from=%s action=%s",
+            payload.subject,
+            payload.from_email,
+            default_action,
         )
+        return {
+            "action": default_action,
+            "title": payload.subject.strip() or "Meeting coordination",
+            "reasoning_trace": default_reasoning,
+            "request_email_body": "Could you please share your preferred time slots and timezone?",
+            "slot": None,
+        }
 
     try:
-        prompts_module = import_module("langchain_core.prompts")
-        output_module = import_module("langchain_core.output_parsers")
-        openai_module = import_module("langchain_openai")
+        gemini_module = import_module("google.genai")
     except ModuleNotFoundError:
-        return (
-            "Thought: LangChain packages unavailable. "
-            f"Action: deterministic pipeline({tool_status})."
+        logger.info(
+            "Agent decision source=fallback reason=missing_google_genai subject=%s from=%s action=%s",
+            payload.subject,
+            payload.from_email,
+            default_action,
         )
-
-    prompt = prompts_module.ChatPromptTemplate.from_messages(
-        [
-            ("system", SYSTEM_PROMPT),
-            (
-                "human",
-                "Generate a one-line ReAct-style trace for this email. "
-                "Subject: {subject}. Body: {body}. Tool status: {tool_status}.",
-            ),
-        ]
-    )
-    llm = openai_module.ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key, temperature=0)
-    chain = prompt | llm | output_module.StrOutputParser()
-    return await chain.ainvoke(
-        {
-            "subject": payload.subject,
-            "body": payload.body_text[:500],
-            "tool_status": tool_status,
+        return {
+            "action": default_action,
+            "title": payload.subject.strip() or "Meeting coordination",
+            "reasoning_trace": default_reasoning,
+            "request_email_body": "Could you please share your preferred time slots and timezone?",
+            "slot": None,
         }
+
+    prompt = AGENT_ANALYSIS_PROMPT.format(
+        subject=payload.subject,
+        from_email=payload.from_email,
+        participants=", ".join(payload.participants),
+        body=payload.body_text[:2000],
     )
+    client = gemini_module.Client(api_key=settings.gemini_api_key)
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model=settings.gemini_model,
+        contents=prompt,
+    )
+    output_text = getattr(response, "text", "") or ""
+    parsed = _extract_json_payload(output_text)
+    if parsed is None:
+        logger.info(
+            "Agent decision source=fallback reason=invalid_gemini_json subject=%s from=%s action=%s",
+            payload.subject,
+            payload.from_email,
+            default_action,
+        )
+        return {
+            "action": default_action,
+            "title": payload.subject.strip() or "Meeting coordination",
+            "reasoning_trace": "Thought: invalid Gemini JSON response. Action: deterministic fallback.",
+            "request_email_body": "Could you please share your preferred time slots and timezone?",
+            "slot": None,
+        }
+    logger.info(
+        "Agent decision source=gemini subject=%s from=%s action=%s",
+        payload.subject,
+        payload.from_email,
+        str(parsed.get("action") or "NO_ACTION"),
+    )
+    return parsed
 
 
 async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
     tools = CalsyncTools()
 
-    session_outcome = await tools.create_session(
-        thread_id=payload.thread_id or f"thread_{payload.message_id}",
-        organizer=payload.from_email,
-        participants=payload.participants,
+    analysis = await _analyze_email_with_gemini(payload)
+    action = str(analysis.get("action") or "NO_ACTION")
+    reasoning_trace = str(analysis.get("reasoning_trace") or "Thought: no-op.")
+    meeting_title = str(analysis.get("title") or payload.subject or "Meeting coordination")
+    session_id = f"sess_{uuid.uuid4().hex[:8]}"
+    recipients = payload.participants
+
+    logger.info(
+        "Agent execution session_id=%s action=%s subject=%s recipients=%s",
+        session_id,
+        action,
+        payload.subject,
+        len(recipients),
     )
-    parse_outcome = await tools.parse_availability(payload.body_text)
 
-    if _looks_like_new_meeting(payload.subject, payload.body_text):
-        action = "SENT_AVAILABILITY_REQUEST"
-    else:
-        action = "NO_ACTION"
+    if action == "SENT_AVAILABILITY_REQUEST":
+        request_body = str(
+            analysis.get("request_email_body")
+            or "Thanks for reaching out. Please share your preferred time slots and timezone so I can coordinate."
+        )
+        gmail_outcome = await tools.send_gmail_message(
+            recipients=recipients,
+            subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
+            body_text=request_body,
+            thread_id=payload.thread_id,
+        )
+        reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
 
-    tool_status = f"create_session={session_outcome.status}, parse_availability={parse_outcome.status}"
-    reasoning_trace = await _optional_llm_trace(payload, tool_status)
+    elif action == "BOOKED_CALENDAR":
+        slot = analysis.get("slot") if isinstance(analysis.get("slot"), dict) else {}
+        calendar_slot = {
+            "start": str(slot.get("start_iso") or ""),
+            "end": str(slot.get("end_iso") or ""),
+            "timezone": str(slot.get("timezone") or "UTC"),
+        }
+        calendar_outcome = await tools.book_calendar(
+            title=meeting_title,
+            participants=recipients,
+            slot=calendar_slot,
+        )
+        reasoning_trace = f"{reasoning_trace} Tool: book_calendar={calendar_outcome.status}."
 
-    session_id = str(session_outcome.payload.get("session_id") or f"sess_{uuid.uuid4().hex[:8]}")
+        confirmation_body = (
+            "Your meeting has been coordinated and added to the calendar. "
+            f"Slot: {calendar_slot['start']} to {calendar_slot['end']} ({calendar_slot['timezone']})."
+        )
+        gmail_outcome = await tools.send_gmail_message(
+            recipients=recipients,
+            subject=f"Calendar confirmed: {meeting_title}",
+            body_text=confirmation_body,
+            thread_id=payload.thread_id,
+        )
+        reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
 
     return AgentProcessResponse(
         agent_result=AgentResult(
             action_taken=action,
             session_id=session_id,
-            emails_sent_to=payload.participants,
+            emails_sent_to=recipients,
             reasoning_trace=reasoning_trace,
         )
     )

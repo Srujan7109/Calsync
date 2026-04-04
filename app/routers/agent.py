@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/v1/agent", tags=["agent"])
     "/process",
     response_model=AgentProcessResponse,
     summary="Process an email through the coordination agent",
-    description="Internal trigger endpoint for LangChain ReAct-style orchestration.",
+    description="Internal trigger endpoint for Gemini + MCP orchestration.",
     responses={
         200: {
             "description": "Agent execution completed",

@@ -29,13 +29,14 @@ class Settings(BaseSettings):
     imap_poll_batch_size: int = 20
     imap_auto_poll_enabled: bool = True
 
-    langchain_enabled: bool = True
-    openai_api_key: str | None = None
-    openai_model: str = "gpt-4o-mini"
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-1.5-flash"
 
-    compute_mcp_url: str | None = None
-    state_mcp_url: str | None = None
+    gmail_sender_email: str | None = None
+    gmail_mcp_url: str | None = None
+    gmail_mcp_send_path: str = "/mcp/gmail/send"
     calendar_mcp_url: str | None = None
+    calendar_mcp_book_path: str = "/mcp/calendar/book"
 
 
 @lru_cache

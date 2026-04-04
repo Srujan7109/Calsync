@@ -28,6 +28,77 @@ FastAPI backend for the Calsync email coordination agent.
 uvicorn app.main:app --reload
 ```
 
+## Agent configuration (Gemini + MCP)
+
+Set these in `.env` for the coordination agent:
+
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL` (default: `gemini-2.5-flash-lite`)
+- `GMAIL_MCP_URL` (base URL for Gmail API MCP server)
+- `GMAIL_SENDER_EMAIL` (optional sender identity)
+- `CALENDAR_MCP_URL` (base URL for Calendar API MCP server)
+- `GMAIL_MCP_SEND_PATH` (optional, default: `/mcp/gmail/send`)
+- `CALENDAR_MCP_BOOK_PATH` (optional, default: `/mcp/calendar/book`)
+
+Use `.env.example` as the handoff template for teammates.
+
+## MCP teammate handoff (plug-and-play)
+
+Give your Gmail MCP and Calendar MCP teammates these exact contracts.
+
+### 1) Gmail MCP contract
+
+Calsync sends `POST {GMAIL_MCP_URL}{GMAIL_MCP_SEND_PATH}` with JSON:
+
+```json
+{
+  "action": "SEND_EMAIL",
+  "from": "calsync1.ai@gmail.com",
+  "to": ["alice@example.com", "bob@example.com"],
+  "subject": "Re: Meeting",
+  "body_text": "Could you please share your preferred time slots and timezone?",
+  "thread_id": "thread_abc123"
+}
+```
+
+Expected behavior:
+
+- Return HTTP 2xx for success.
+- Return JSON body (any shape is accepted and logged).
+
+### 2) Calendar MCP contract
+
+Calsync sends `POST {CALENDAR_MCP_URL}{CALENDAR_MCP_BOOK_PATH}` with JSON:
+
+```json
+{
+  "action": "BOOK_MEETING",
+  "title": "Team Sync",
+  "slot": {
+    "start": "2026-04-05T10:00:00Z",
+    "end": "2026-04-05T10:30:00Z",
+    "timezone": "UTC"
+  },
+  "participants": ["alice@example.com", "bob@example.com"],
+  "description": "Coordinated by CalSync.ai",
+  "fallback_slots": []
+}
+```
+
+Expected behavior:
+
+- Return HTTP 2xx for success.
+- Return JSON body (any shape is accepted and logged).
+
+### 3) Quick integration check
+
+1. Copy `.env.example` to `.env` and fill Gemini + MCP values.
+2. Start server with `uvicorn app.main:app --reload`.
+3. Trigger agent endpoint (`POST /api/v1/agent/process`) from Postman collection.
+4. Confirm logs include:
+   - `Agent decision source=gemini ... action=...`
+   - tool outcomes in reasoning trace (`send_gmail_message=OK`, `book_calendar=OK`)
+
 ## API Docs (Swagger)
 
 After server startup:
@@ -46,14 +117,14 @@ Request JSON:
 
 ```json
 {
-   "email_hash": "sha256-hex-string",
-   "message_id": "<CABc123@mail.gmail.com>",
-   "from_email": "alice@example.com",
-   "subject": "Schedule a team meeting next week",
-   "body_text": "Hi CalSync, I am available Monday 2-5pm...",
-   "thread_id": "thread_abc123",
-   "participants": ["alice@example.com", "bob@example.com"],
-   "received_at": "2025-01-01T09:00:00Z"
+  "email_hash": "sha256-hex-string",
+  "message_id": "<CABc123@mail.gmail.com>",
+  "from_email": "alice@example.com",
+  "subject": "Schedule a team meeting next week",
+  "body_text": "Hi CalSync, I am available Monday 2-5pm...",
+  "thread_id": "thread_abc123",
+  "participants": ["alice@example.com", "bob@example.com"],
+  "received_at": "2025-01-01T09:00:00Z"
 }
 ```
 
@@ -61,12 +132,12 @@ Response JSON:
 
 ```json
 {
-   "agent_result": {
-      "action_taken": "SENT_AVAILABILITY_REQUEST",
-      "session_id": "sess_xyz789",
-      "emails_sent_to": ["bob@example.com"],
-      "reasoning_trace": "Thought: New meeting request... Action: create_session..."
-   }
+  "agent_result": {
+    "action_taken": "SENT_AVAILABILITY_REQUEST",
+    "session_id": "sess_xyz789",
+    "emails_sent_to": ["bob@example.com"],
+    "reasoning_trace": "Thought: New meeting request... Action: create_session..."
+  }
 }
 ```
 

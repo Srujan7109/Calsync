@@ -1,1 +1,1 @@
-"""LangChain-based agent orchestration module for Calsync."""
+"""Gemini-based agent orchestration module for Calsync."""
