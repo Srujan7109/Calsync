@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import json
+import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, Request, UploadFile
 
 from ingestion.app.config import get_settings
 from ingestion.app.models.email_models import (
@@ -16,9 +21,18 @@ from ingestion.app.models.email_models import (
 from ingestion.app.services.participant_utils import dedupe_emails, exclude_emails, parse_email_addresses
 from ingestion.app.services.background_tasks import process_email_task
 from ingestion.app.services.dedup_service import build_email_hash, check_and_mark_duplicate
+from ingestion.app.services.gmail_push_handler import schedule_push_ingestion
 
 
 router = APIRouter(prefix="/api/v1/webhook", tags=["webhook"])
+logger = logging.getLogger("uvicorn.error")
+
+
+def _decode_pubsub_data(encoded_data: str) -> dict[str, Any]:
+    padded = encoded_data + "=" * (-len(encoded_data) % 4)
+    raw = base64.urlsafe_b64decode(padded.encode("utf-8"))
+    payload = json.loads(raw.decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
 
 
 @router.get("/health", summary="Webhook health check", description="Returns service health for webhook ingress.")
@@ -103,3 +117,47 @@ async def receive_email(
     background_tasks.add_task(process_email_task, background_payload.model_dump())
 
     return WebhookAcceptedResponse(task_id=task_id)
+
+
+@router.post(
+    "/gmail/push",
+    summary="Receive Gmail Pub/Sub push notifications",
+    description=(
+        "Accepts Pub/Sub push notifications from Gmail watch and triggers a "
+        "debounced immediate inbox fetch for low-latency processing."
+    ),
+)
+async def receive_gmail_push(request: Request) -> dict[str, str | bool]:
+    settings = get_settings()
+
+    if not settings.gmail_push_enabled:
+        return {"status": "ignored", "reason": "gmail_push_disabled"}
+
+    body = await request.json()
+    message = body.get("message") if isinstance(body, dict) else None
+    data = message.get("data") if isinstance(message, dict) else None
+
+    if not isinstance(data, str) or not data.strip():
+        return {"status": "ignored", "reason": "missing_pubsub_data"}
+
+    try:
+        payload = _decode_pubsub_data(data)
+    except (ValueError, json.JSONDecodeError, binascii.Error) as exc:
+        logger.warning("Invalid Gmail push payload: %s", exc)
+        return {"status": "ignored", "reason": "invalid_pubsub_payload"}
+
+    scheduled = await schedule_push_ingestion(
+        limit=settings.gmail_push_fetch_limit,
+        debounce_ms=settings.gmail_push_debounce_ms,
+    )
+    logger.info(
+        "Gmail push received email=%s history_id=%s scheduled=%s",
+        payload.get("emailAddress", ""),
+        payload.get("historyId", ""),
+        scheduled,
+    )
+
+    return {
+        "status": "accepted",
+        "scheduled": scheduled,
+    }

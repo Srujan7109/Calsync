@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     imap_poll_batch_size: int = 20
     imap_auto_poll_enabled: bool = True
     use_gmail_api_polling: bool = True
+    gmail_push_enabled: bool = False
+    gmail_push_fetch_limit: int = 20
+    gmail_push_debounce_ms: int = 400
 
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"

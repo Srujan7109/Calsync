@@ -186,6 +186,34 @@ Set these in `.env` before polling:
 
 When auto polling is enabled, the server checks IMAP every 10 seconds in the background.
 
+## Near-instant Gmail ingestion (recommended for low latency)
+
+For low latency, use Gmail watch + Pub/Sub push notifications and let ingestion
+trigger immediately on each mailbox event.
+
+Set these in `ingestion/.env`:
+
+- `GMAIL_PUSH_ENABLED=true`
+- `GMAIL_PUSH_FETCH_LIMIT=20`
+- `GMAIL_PUSH_DEBOUNCE_MS=400`
+- `USE_GMAIL_API_POLLING=true`
+- `IMAP_AUTO_POLL_ENABLED=false` (optional but recommended once push is stable)
+
+Push callback endpoint (configure this as the Pub/Sub push URL):
+
+- `POST /api/v1/webhook/gmail/push`
+
+Enable Gmail watch using Gmail MCP:
+
+```bash
+curl -X POST "http://127.0.0.1:8006/watch/setup" \
+  -H "Content-Type: application/json" \
+  -d '{"profile_id":"calsync-primary"}'
+```
+
+This avoids waiting for poll intervals and starts processing almost immediately
+after Gmail emits a watch notification.
+
 Trigger poll:
 
 ```powershell

@@ -29,6 +29,10 @@ Calsync backend is an event ingestion and coordination engine designed to:
   - Manually trigger inbox fetch from configured IMAP account
   - Query param: `limit` (1-100, default 20)
   - Runs on configurable interval (default: every 10 seconds in background)
+- **Gmail Push Webhook:** `POST /api/v1/webhook/gmail/push`
+  - Accepts Google Pub/Sub push notifications from Gmail watch
+  - Debounces burst notifications and triggers immediate Gmail fetch
+  - Designed for near-instant processing without interval wait
 
 ### 2. Deduplication Layer
 
@@ -94,6 +98,19 @@ IMAP_POLL_INTERVAL_SECONDS=10
 IMAP_POLL_BATCH_SIZE=20
 ```
 
+### Gmail Push (Low Latency)
+
+```
+USE_GMAIL_API_POLLING=true
+GMAIL_PUSH_ENABLED=true
+GMAIL_PUSH_FETCH_LIMIT=20
+GMAIL_PUSH_DEBOUNCE_MS=400
+IMAP_AUTO_POLL_ENABLED=false
+```
+
+Also configure Gmail watch on the Gmail MCP service and route Pub/Sub push
+notifications to `/api/v1/webhook/gmail/push`.
+
 ### Deduplication Backend
 
 ```
@@ -144,6 +161,7 @@ ACCEPTED_KEYWORDS=schedule,meeting,call,sync,standup,discuss,touch base
 | ------ | ------------------------ | ----------------------- |
 | GET    | `/api/v1/webhook/health` | Service health check    |
 | POST   | `/api/v1/webhook/email`  | Ingest scheduling email |
+| POST   | `/api/v1/webhook/gmail/push`  | Pub/Sub trigger for instant Gmail ingest |
 
 ### IMAP
 

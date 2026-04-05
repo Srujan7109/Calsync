@@ -107,15 +107,20 @@ async def _gemini(prompt: str, settings) -> str:
     client = genai.Client(api_key=settings.gemini_api_key)
     for attempt in range(3):
         try:
-            resp = await asyncio.to_thread(
-                client.models.generate_content,
-                model=settings.gemini_model,
-                contents=prompt,
+            # Hard timeout so agent flow (email dispatch/booking) never blocks on LLM latency.
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=settings.gemini_model,
+                    contents=prompt,
+                ),
+                timeout=8,
             )
             return getattr(resp, "text", "") or ""
         except Exception as exc:
             if ("429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)) and attempt < 2:
-                await asyncio.sleep(30 * (attempt + 1))
+                # Short backoff; do not stall scheduling workflow for minutes.
+                await asyncio.sleep(2 * (attempt + 1))
                 continue
             logger.warning("Gemini call failed: %s", exc)
             return ""
@@ -278,7 +283,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
     # ══════════════════════════════════════════════════════════════════════════
     if is_new and session.status != "BOOKED":
         # Extract meeting title from Gemini if possible
-        if settings.gemini_api_key:
+        if settings.gemini_api_key and not (payload.subject or "").strip():
             title_prompt = f"Extract a short 3-5 word meeting title from this email subject/body. Return ONLY the title text.\nSubject: {payload.subject}\nBody: {payload.body_text[:500]}"
             title = await _gemini(title_prompt, settings)
             if title.strip():
@@ -301,7 +306,15 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                 thread_id="",
                 session_id=session_id,
             )
-            logger.info("Availability request sent to %s status=%s", p, result.status)
+            if result.status == "OK":
+                logger.info("Availability request sent to %s status=%s", p, result.status)
+            else:
+                logger.warning(
+                    "Availability request failed to %s status=%s payload=%s",
+                    p,
+                    result.status,
+                    result.payload,
+                )
 
         session.last_reminder_at = _now_iso()
         session.status = "AWAITING_REPLIES"
