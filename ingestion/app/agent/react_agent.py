@@ -333,12 +333,32 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
         # Rebuild replied/pending from persisted collected_slots so simultaneous replies don't get lost
         collected_now = await thread_service.get_collected_slots(session_id)
         collected_responders = {str(p).lower() for p in (collected_now or {}).keys()}
-        replied = [p for p in all_p if p.lower() in collected_responders]
+        persisted_replied = {str(p).lower() for p in (session.replied_participants or [])}
+        merged_replied = persisted_replied | collected_responders
+        replied = [p for p in all_p if p.lower() in merged_replied]
         replied_set = {e.lower() for e in replied}
         pending = [p for p in all_p if p.lower() not in replied_set]
         replied_count = len(replied)
         total_count = len(all_p)
         all_replied = replied_count == total_count
+
+        # Hard guard: once a session has reached READY_TO_COMPUTE/BOOKED, don't allow
+        # reply progress to regress unless we explicitly reset status to AWAITING_REPLIES.
+        reached_all_replied_before = session.status in ("READY_TO_COMPUTE", "BOOKED")
+        if reached_all_replied_before and not all_replied:
+            logger.warning(
+                "Reply regression prevented session=%s status=%s replied=%d total=%d",
+                session_id,
+                session.status,
+                replied_count,
+                total_count,
+            )
+            replied = list(all_p)
+            replied_set = {e.lower() for e in replied}
+            pending = []
+            replied_count = total_count
+            all_replied = True
+
         logger.info(
             "Reply progress session=%s replied=%d total=%d all_replied=%s pending=%s",
             session_id,

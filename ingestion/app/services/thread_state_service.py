@@ -234,19 +234,35 @@ class ThreadStateService:
                     r = await client.get(
                         table_url,
                         headers=self._headers(),
-                        params={"select": "collected_slots", "session_id": f"eq.{session_id}", "limit": "1"},
+                        params={
+                            "select": "collected_slots,updated_at",
+                            "session_id": f"eq.{session_id}",
+                            "limit": "1",
+                        },
                     )
                     rows = r.json() if r.status_code == 200 else []
-                    current = (rows[0].get("collected_slots") or {}) if rows else {}
+                    if not rows:
+                        logger.warning("update_participant_slots: session not found %s", session_id)
+                        return
+
+                    current = rows[0].get("collected_slots") or {}
+                    current_updated_at = rows[0].get("updated_at")
                     merged = dict(current) if isinstance(current, dict) else {}
                     merged[participant_email] = slots
 
-                    await client.patch(
+                    patch_response = await client.patch(
                         table_url,
-                        headers=self._headers(prefer="return=minimal"),
-                        params={"session_id": f"eq.{session_id}"},
+                        headers=self._headers(prefer="return=representation"),
+                        params={
+                            "session_id": f"eq.{session_id}",
+                            "updated_at": f"eq.{current_updated_at}",
+                        },
                         json={"collected_slots": merged, "updated_at": _utcnow_iso()},
                     )
+                    patch_response.raise_for_status()
+                    patched_rows = patch_response.json() if patch_response.status_code == 200 else []
+                    if isinstance(patched_rows, list) and patched_rows:
+                        return
 
                     verify = await client.get(
                         table_url,

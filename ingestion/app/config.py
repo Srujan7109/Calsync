@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     imap_app_password: str | None = None
     imap_mailbox: str = "INBOX"
     imap_search_criteria: str = "UNSEEN"
-    imap_poll_interval_seconds: int = 10
+    imap_poll_interval_seconds: int = 3
     imap_poll_batch_size: int = 20
     imap_auto_poll_enabled: bool = True
     use_gmail_api_polling: bool = True
