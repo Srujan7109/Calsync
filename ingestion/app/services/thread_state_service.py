@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -67,6 +66,7 @@ class ThreadStateService:
 
         session_row = await self._get_session_by_thread(thread_id)
         if not session_row:
+            # Brand new thread — create session with initial participants
             session_id = f"sess_{uuid.uuid4().hex[:8]}"
             await self._upsert_session_row(
                 session_id=session_id,
@@ -75,6 +75,8 @@ class ThreadStateService:
                 organizer_email=organizer_email,
                 meeting_title=meeting_title,
                 participants=initial_participants,
+                replied_participants=[],
+                last_reminder_at=None,
             )
             return ThreadSessionState(
                 session_id=session_id,
@@ -87,23 +89,33 @@ class ThreadStateService:
                 last_reminder_at=None,
             )
 
+        # Existing session — restore full state from sessions row
         session_id = str(session_row.get("session_id") or f"sess_{uuid.uuid4().hex[:8]}")
-        state = await self._get_app_setting_json(f"session_state:{session_id}")
+        raw_participants = session_row.get("participants") or []
+        raw_replied = session_row.get("replied_participants") or []
+
+        # Merge persisted participants with any new ones from current email
+        merged_participants = list(
+            dict.fromkeys(
+                [p for p in raw_participants if p] +
+                [p for p in initial_participants if p]
+            )
+        )
+
         return ThreadSessionState(
             session_id=session_id,
             thread_id=thread_id,
             status=str(session_row.get("status") or "AWAITING_REPLIES"),
             organizer_email=str(session_row.get("organizer_email") or organizer_email),
             meeting_title=str(session_row.get("meeting_title") or meeting_title),
-            participants=list(state.get("participants") or session_row.get("participants") or initial_participants),
-            replied_participants=list(state.get("replied_participants") or []),
-            last_reminder_at=state.get("last_reminder_at"),
+            participants=merged_participants,
+            replied_participants=list(raw_replied) if isinstance(raw_replied, list) else [],
+            last_reminder_at=session_row.get("last_reminder_at"),
         )
 
     async def persist_state(self, state: ThreadSessionState) -> None:
         if not self._enabled():
             return
-
         await self._upsert_session_row(
             session_id=state.session_id,
             thread_id=state.thread_id,
@@ -111,21 +123,14 @@ class ThreadStateService:
             organizer_email=state.organizer_email,
             meeting_title=state.meeting_title,
             participants=state.participants,
+            replied_participants=state.replied_participants,
+            last_reminder_at=state.last_reminder_at,
         )
-        payload = {
-            "participants": state.participants,
-            "replied_participants": state.replied_participants,
-            "last_reminder_at": state.last_reminder_at,
-            "status": state.status,
-            "thread_id": state.thread_id,
-            "updated_at": _utcnow_iso(),
-        }
-        await self._upsert_app_setting_json(f"session_state:{state.session_id}", payload)
 
     async def _get_session_by_thread(self, thread_id: str) -> dict[str, object] | None:
         table_url = f"{self.base_url}/rest/v1/sessions"
         params = {
-            "select": "session_id,thread_id,status,organizer_email,meeting_title,participants",
+            "select": "session_id,thread_id,status,organizer_email,meeting_title,participants,replied_participants,last_reminder_at",
             "thread_id": f"eq.{thread_id}",
             "limit": "1",
         }
@@ -143,36 +148,34 @@ class ThreadStateService:
         organizer_email: str,
         meeting_title: str,
         participants: list[str],
+        replied_participants: list[str],
+        last_reminder_at: str | None,
     ) -> None:
         table_url = f"{self.base_url}/rest/v1/sessions"
-        payload = {
-            "session_id": session_id,
+        now = _utcnow_iso()
+        update_body = {
             "thread_id": thread_id,
             "status": status,
             "organizer_email": organizer_email,
             "meeting_title": meeting_title or "Meeting",
             "participants": participants,
-            "updated_at": _utcnow_iso(),
+            "replied_participants": replied_participants,
+            "last_reminder_at": last_reminder_at,
+            "updated_at": now,
         }
         async with httpx.AsyncClient(timeout=10.0) as client:
             patch_response = await client.patch(
                 table_url,
                 headers=self._headers(prefer="return=representation"),
                 params={"session_id": f"eq.{session_id}"},
-                json={
-                    "thread_id": thread_id,
-                    "status": status,
-                    "organizer_email": organizer_email,
-                    "meeting_title": meeting_title or "Meeting",
-                    "participants": participants,
-                    "updated_at": payload["updated_at"],
-                },
+                json=update_body,
             )
             patch_response.raise_for_status()
             updated_rows = patch_response.json()
             if isinstance(updated_rows, list) and updated_rows:
                 return
 
+            # Row doesn't exist yet — insert fresh
             insert_payload = {
                 "session_id": session_id,
                 "thread_id": thread_id,
@@ -180,55 +183,15 @@ class ThreadStateService:
                 "organizer_email": organizer_email,
                 "meeting_title": meeting_title or "Meeting",
                 "participants": participants,
+                "replied_participants": replied_participants,
+                "last_reminder_at": last_reminder_at,
                 "collected_slots": {},
-                "created_at": _utcnow_iso(),
-                "updated_at": payload["updated_at"],
+                "created_at": now,
+                "updated_at": now,
             }
             insert_response = await client.post(
                 table_url,
                 headers=self._headers(prefer="return=minimal"),
                 json=insert_payload,
-            )
-            insert_response.raise_for_status()
-
-    async def _get_app_setting_json(self, key: str) -> dict[str, object]:
-        table_url = f"{self.base_url}/rest/v1/app_settings"
-        params = {"select": "value", "key": f"eq.{key}", "limit": "1"}
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(table_url, headers=self._headers(), params=params)
-            response.raise_for_status()
-            rows = response.json()
-            if not rows:
-                return {}
-            value = rows[0].get("value")
-            if isinstance(value, dict):
-                return value
-            if isinstance(value, str):
-                try:
-                    parsed = json.loads(value)
-                    return parsed if isinstance(parsed, dict) else {}
-                except json.JSONDecodeError:
-                    return {}
-            return {}
-
-    async def _upsert_app_setting_json(self, key: str, value: dict[str, object]) -> None:
-        table_url = f"{self.base_url}/rest/v1/app_settings"
-        payload = {"key": key, "value": value}
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            patch_response = await client.patch(
-                table_url,
-                headers=self._headers(prefer="return=representation"),
-                params={"key": f"eq.{key}"},
-                json={"value": value},
-            )
-            patch_response.raise_for_status()
-            updated_rows = patch_response.json()
-            if isinstance(updated_rows, list) and updated_rows:
-                return
-
-            insert_response = await client.post(
-                table_url,
-                headers=self._headers(prefer="return=minimal"),
-                json=payload,
             )
             insert_response.raise_for_status()

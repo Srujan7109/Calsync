@@ -64,7 +64,7 @@ async def collect_imap_payloads(limit: int) -> ImapIngestionResult:
                 thread_id=email_item.message_id,
                 participants=exclude_emails(
                     dedupe_emails(
-                        parse_email_addresses(email_item.to) + parse_email_addresses(email_item.sender)
+                        parse_email_addresses(email_item.to) + parse_email_addresses(email_item.sender) + parse_email_addresses(email_item.cc)
                     ),
                     [settings.gmail_sender_email or "", settings.imap_username or ""],
                 ),

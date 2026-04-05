@@ -14,6 +14,7 @@ from ingestion.app.config import Settings
 class ImapEmail:
     sender: str
     to: str
+    cc: str
     subject: str
     body_text: str
     message_id: str
@@ -97,6 +98,7 @@ def fetch_emails(settings: Settings, limit: int = 20) -> list[ImapEmail]:
             parsed = email.message_from_bytes(raw_email)
             sender_raw = _decode_header_value(parsed.get("From"))
             to_value = _decode_header_value(parsed.get("To"))
+            cc_value = _decode_header_value(parsed.get("Cc"))
             subject_value = _decode_header_value(parsed.get("Subject"))
             message_id = _decode_header_value(parsed.get("Message-ID"))
             body_text = _extract_text_from_message(parsed)
@@ -105,11 +107,17 @@ def fetch_emails(settings: Settings, limit: int = 20) -> list[ImapEmail]:
                 ImapEmail(
                     sender=_extract_sender(sender_raw),
                     to=to_value,
+                    cc=cc_value,
                     subject=subject_value,
                     body_text=body_text,
                     message_id=message_id,
                 )
             )
+
+        try:
+            mail.store(uid, "+FLAGS", "\\Seen")
+        except Exception:
+            pass
 
         return emails
     finally:

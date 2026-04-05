@@ -53,6 +53,7 @@ async def receive_email(
     background_tasks: BackgroundTasks,
     sender: str = Form(default="", alias="from"),
     to: str = Form(default=""),
+    cc: str = Form(default=""),
     subject: str = Form(default=""),
     text: str = Form(default=""),
     html: str | None = Form(default=None),
@@ -85,7 +86,7 @@ async def receive_email(
         return NotSchedulingResponse()
 
     task_id = f"bg_task_{uuid.uuid4().hex[:8]}"
-    participants = dedupe_emails(parse_email_addresses(payload.to) + parse_email_addresses(payload.sender))
+    participants = dedupe_emails(parse_email_addresses(payload.to) + parse_email_addresses(payload.sender)+parse_email_addresses(payload.cc))
     participants = exclude_emails(participants, [settings.gmail_sender_email or ""])
     thread_id = payload.message_id.strip()
 
