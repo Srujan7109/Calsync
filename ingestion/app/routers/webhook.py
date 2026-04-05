@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, BackgroundTasks, File, Form, UploadFile
+
+from ingestion.app.config import get_settings
+from ingestion.app.models.email_models import (
+    AgentProcessPayload,
+    DuplicateResponse,
+    EmailWebhookPayload,
+    NotSchedulingResponse,
+    WebhookAcceptedResponse,
+)
+from ingestion.app.services.participant_utils import dedupe_emails, exclude_emails, parse_email_addresses
+from ingestion.app.services.background_tasks import process_email_task
+from ingestion.app.services.dedup_service import build_email_hash, check_and_mark_duplicate
+
+
+router = APIRouter(prefix="/api/v1/webhook", tags=["webhook"])
+
+
+@router.get("/health", summary="Webhook health check", description="Returns service health for webhook ingress.")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.post(
+    "/email",
+    response_model=WebhookAcceptedResponse | DuplicateResponse | NotSchedulingResponse,
+    summary="Receive inbound scheduling email",
+    description=(
+        "Accepts SendGrid-style multipart form payload, computes idempotency hash, "
+        "applies keyword edge filter, and queues async processing."
+    ),
+    responses={
+        200: {
+            "description": "Email accepted, deduplicated, or filtered",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "accepted": {"summary": "Accepted", "value": {"status": "accepted", "task_id": "bg_task_abc123"}},
+                        "duplicate": {"summary": "Duplicate", "value": {"status": "duplicate_discarded"}},
+                        "filtered": {"summary": "Not scheduling related", "value": {"status": "not_scheduling_related"}},
+                    }
+                }
+            },
+        }
+    },
+)
+async def receive_email(
+    background_tasks: BackgroundTasks,
+    sender: str = Form(default="", alias="from"),
+    to: str = Form(default=""),
+    cc: str = Form(default=""),
+    subject: str = Form(default=""),
+    text: str = Form(default=""),
+    html: str | None = Form(default=None),
+    message_id: str = Form(default=""),
+    headers: str | None = Form(default=None),
+    spam_score: str | None = Form(default=None),
+    attachments: list[UploadFile] | None = File(default=None),
+):
+    settings = get_settings()
+    _ = attachments
+
+    payload = EmailWebhookPayload(
+        sender=sender,
+        to=to,
+        subject=subject,
+        text=text,
+        html=html,
+        message_id=message_id,
+        headers=headers,
+        spam_score=spam_score,
+    )
+
+    email_hash = build_email_hash(payload.sender, payload.message_id)
+
+    if await check_and_mark_duplicate(email_hash):
+        return DuplicateResponse()
+
+    text_lower = f"{payload.subject} {payload.text[:200]}".lower()
+    if not any(keyword in text_lower for keyword in settings.accepted_keywords):
+        return NotSchedulingResponse()
+
+    task_id = f"bg_task_{uuid.uuid4().hex[:8]}"
+    participants = dedupe_emails(parse_email_addresses(payload.to) + parse_email_addresses(payload.sender)+parse_email_addresses(payload.cc))
+    participants = exclude_emails(participants, [settings.gmail_sender_email or ""])
+    thread_id = payload.message_id.strip()
+
+    background_payload = AgentProcessPayload(
+        email_hash=email_hash,
+        message_id=payload.message_id,
+        from_email=payload.sender,
+        subject=payload.subject,
+        body_text=payload.text,
+        thread_id=thread_id,
+        participants=participants,
+        received_at=datetime.now(timezone.utc).isoformat(),
+    )
+    background_tasks.add_task(process_email_task, background_payload.model_dump())
+
+    return WebhookAcceptedResponse(task_id=task_id)

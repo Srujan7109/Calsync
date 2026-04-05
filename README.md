@@ -1,6 +1,10 @@
 # Calsync
 
-FastAPI backend for the Calsync email coordination agent.
+Monorepo for the Calsync email coordination platform.
+
+- `ingestion/`: FastAPI ingestion and Gemini orchestration service (port 8000)
+- `mcp_servers/gmail_mcp/`: Gmail MCP service (port 8006)
+- `mcp_servers/calendar_mcp/`: Calendar MCP service (port 8002)
 
 ## Setup (Windows PowerShell)
 
@@ -19,18 +23,109 @@ FastAPI backend for the Calsync email coordination agent.
 3. Install dependencies:
 
    ```powershell
-   pip install -r requirements.txt
+   pip install -r ingestion/requirements.txt
+   pip install -r mcp_servers/gmail_mcp/requirements.txt
+   pip install -r mcp_servers/calendar_mcp/requirements.txt
    ```
+
+4. Optional dev dependencies:
+
+  ```powershell
+  pip install -r requirements-dev.txt
+  ```
 
 ## Run locally
 
-```bash
-uvicorn app.main:app --reload
+```powershell
+uvicorn ingestion.app.main:app --reload --port 8000
 ```
+
+## Agent configuration (Gemini + MCP)
+
+Set these in `.env` for the coordination agent:
+
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL` (default: `gemini-2.5-flash-lite`)
+- `GMAIL_MCP_URL` (base URL for Gmail API MCP server)
+- `GMAIL_SENDER_EMAIL` (optional sender identity)
+- `CALENDAR_MCP_URL` (base URL for Calendar API MCP server)
+- `GMAIL_MCP_SEND_PATH` (optional, default: `/send`)
+- `CALENDAR_MCP_BOOK_PATH` (optional, default: `/book`)
+- `CALENDAR_MCP_FREEBUSY_PATH` (optional, default: `/freebusy`)
+
+Use `.env.example` as the handoff template for teammates.
+
+## MCP teammate handoff (plug-and-play)
+
+Give your Gmail MCP and Calendar MCP teammates these exact contracts.
+
+### 1) Gmail MCP contract
+
+Calsync sends `POST {GMAIL_MCP_URL}{GMAIL_MCP_SEND_PATH}` with JSON:
+
+```json
+{
+  "to_emails": ["alice@example.com", "bob@example.com"],
+  "subject": "Re: Meeting",
+  "body_text": "Could you please share your preferred time slots and timezone?",
+  "thread_id": "thread_abc123",
+  "session_id": "sess_xyz789"
+}
+```
+
+Expected behavior:
+
+- Return HTTP 2xx for success.
+- Return JSON body (any shape is accepted and logged).
+
+### 2) Calendar MCP contract
+
+Calsync first sends `POST {CALENDAR_MCP_URL}{CALENDAR_MCP_FREEBUSY_PATH}`:
+
+```json
+{
+  "participants": ["alice@example.com", "bob@example.com"],
+  "slots": [{ "start": "2026-04-05T10:00:00Z", "end": "2026-04-05T10:30:00Z" }]
+}
+```
+
+Then Calsync sends `POST {CALENDAR_MCP_URL}{CALENDAR_MCP_BOOK_PATH}`:
+
+```json
+{
+  "action": "BOOK_MEETING",
+  "title": "Team Sync",
+  "slot": {
+    "start": "2026-04-05T10:00:00Z",
+    "end": "2026-04-05T10:30:00Z"
+  },
+  "participants": ["alice@example.com", "bob@example.com"],
+  "organizer_email": "alice@example.com",
+  "description": "Coordinated by CalSync.ai",
+  "fallback_slots": [],
+  "session_id": "sess_xyz789"
+}
+```
+
+Expected behavior:
+
+- Return HTTP 2xx for success.
+- Return JSON body (any shape is accepted and logged).
+
+### 3) Quick integration check
+
+1. Copy `.env.example` to `.env` and fill Gemini + MCP values.
+2. Start ingestion server with `uvicorn ingestion.app.main:app --reload --port 8000`.
+3. Start Gmail MCP with `uvicorn mcp_servers.gmail_mcp.server:app --reload --port 8006`.
+4. Start Calendar MCP with `uvicorn mcp_servers.calendar_mcp.server:app --reload --port 8002`.
+5. Trigger agent endpoint (`POST /api/v1/agent/process`) from Postman collection.
+4. Confirm logs include:
+   - `Agent decision source=gemini ... action=...`
+   - tool outcomes in reasoning trace (`send_gmail_message=OK`, `book_calendar=OK`)
 
 ## API Docs (Swagger)
 
-After server startup:
+After ingestion server startup:
 
 - Swagger UI: `http://127.0.0.1:8000/docs`
 - ReDoc: `http://127.0.0.1:8000/redoc`
@@ -46,14 +141,14 @@ Request JSON:
 
 ```json
 {
-   "email_hash": "sha256-hex-string",
-   "message_id": "<CABc123@mail.gmail.com>",
-   "from_email": "alice@example.com",
-   "subject": "Schedule a team meeting next week",
-   "body_text": "Hi CalSync, I am available Monday 2-5pm...",
-   "thread_id": "thread_abc123",
-   "participants": ["alice@example.com", "bob@example.com"],
-   "received_at": "2025-01-01T09:00:00Z"
+  "email_hash": "sha256-hex-string",
+  "message_id": "<CABc123@mail.gmail.com>",
+  "from_email": "alice@example.com",
+  "subject": "Schedule a team meeting next week",
+  "body_text": "Hi CalSync, I am available Monday 2-5pm...",
+  "thread_id": "thread_abc123",
+  "participants": ["alice@example.com", "bob@example.com"],
+  "received_at": "2025-01-01T09:00:00Z"
 }
 ```
 
@@ -61,12 +156,12 @@ Response JSON:
 
 ```json
 {
-   "agent_result": {
-      "action_taken": "SENT_AVAILABILITY_REQUEST",
-      "session_id": "sess_xyz789",
-      "emails_sent_to": ["bob@example.com"],
-      "reasoning_trace": "Thought: New meeting request... Action: create_session..."
-   }
+  "agent_result": {
+    "action_taken": "SENT_AVAILABILITY_REQUEST",
+    "session_id": "sess_xyz789",
+    "emails_sent_to": ["bob@example.com"],
+    "reasoning_trace": "Thought: New meeting request... Action: create_session..."
+  }
 }
 ```
 
@@ -93,7 +188,7 @@ When auto polling is enabled, the server checks IMAP every 10 seconds in the bac
 
 Trigger poll:
 
-```bash
+```powershell
 curl -X POST "http://127.0.0.1:8000/api/v1/imap/poll?limit=20"
 ```
 

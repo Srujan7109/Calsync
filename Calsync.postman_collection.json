@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "f2af12f1-9f95-4f47-9bb1-58be995bc3e9",
     "name": "Calsync API",
-    "description": "Postman collection for the Calsync FastAPI backend, including webhook ingress, IMAP polling, and the internal LangChain agent contract.",
+    "description": "Postman collection for the Calsync FastAPI backend, including webhook ingress, IMAP polling, and the internal Gemini + MCP agent contract.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
