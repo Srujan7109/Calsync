@@ -7,7 +7,7 @@ from ingestion.app.services.background_tasks import process_email_task
 from ingestion.app.services.imap_ingestion import collect_imap_payloads
 
 
-router = APIRouter(prefix="/api/v1/imap", tags=["imap"])
+router = APIRouter(tags=["imap"])
 
 
 @router.post(

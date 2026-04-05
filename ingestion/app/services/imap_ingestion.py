@@ -10,6 +10,7 @@ from ingestion.app.models.email_models import AgentProcessPayload
 from ingestion.app.services.participant_utils import dedupe_emails, exclude_emails, parse_email_addresses
 from ingestion.app.services.dedup_service import build_email_hash, check_and_mark_duplicate
 from ingestion.app.services.imap_service import fetch_emails
+from ingestion.app.services.thread_memory_service import ThreadMemoryService
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -26,6 +27,7 @@ class ImapIngestionResult:
 
 async def collect_imap_payloads(limit: int) -> ImapIngestionResult:
     settings = get_settings()
+    thread_memory = ThreadMemoryService()
     emails = await asyncio.to_thread(fetch_emails, settings, limit)
 
     payloads: list[AgentProcessPayload] = []
@@ -48,8 +50,26 @@ async def collect_imap_payloads(limit: int) -> ImapIngestionResult:
             logger.info("♻️ IMAP skipped duplicate message_id=%s", email_item.message_id)
             continue
 
-        text_lower = f"{email_item.subject} {email_item.body_text[:200]}".lower()
-        if not any(keyword in text_lower for keyword in settings.accepted_keywords):
+        email_text = f"{email_item.subject} {email_item.body_text[:1000]}".lower()
+        accepted = any(keyword in email_text for keyword in settings.accepted_keywords)
+
+        await thread_memory.store_email(
+            message_id=email_item.message_id,
+            thread_id=email_item.thread_id,
+            from_email=email_item.sender,
+            to_emails=parse_email_addresses(email_item.to),
+            cc_emails=parse_email_addresses(email_item.cc),
+            subject=email_item.subject,
+            body_text=email_item.body_text,
+            received_at=datetime.now(timezone.utc).isoformat(),
+            email_hash=email_hash,
+            in_reply_to=email_item.in_reply_to,
+            references_header=email_item.references,
+            processing_status="PENDING" if accepted else "IGNORED",
+            is_read=True,
+        )
+
+        if not accepted:
             filtered_out += 1
             logger.info("🧹 IMAP filtered by keywords subject=%s", email_item.subject)
             continue
@@ -61,7 +81,9 @@ async def collect_imap_payloads(limit: int) -> ImapIngestionResult:
                 from_email=email_item.sender,
                 subject=email_item.subject,
                 body_text=email_item.body_text,
-                thread_id=email_item.message_id,
+                thread_id=email_item.thread_id,
+                in_reply_to=email_item.in_reply_to,
+                references=email_item.references,
                 participants=exclude_emails(
                     dedupe_emails(
                         parse_email_addresses(email_item.to) + parse_email_addresses(email_item.sender) + parse_email_addresses(email_item.cc)

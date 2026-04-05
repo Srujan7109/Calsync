@@ -32,6 +32,8 @@ class AgentProcessPayload(BaseModel):
     subject: str = Field(description="Email subject")
     body_text: str = Field(description="Email plain text body")
     thread_id: str = Field(default="", description="Conversation thread id if available")
+    in_reply_to: str = Field(default="", description="RFC 2822 In-Reply-To header")
+    references: str = Field(default="", description="RFC 2822 References header chain")
     participants: list[str] = Field(default_factory=list)
     received_at: str = Field(description="UTC timestamp when Calsync received the email")
 

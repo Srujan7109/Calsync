@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from email import message_from_string
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, UploadFile
 
@@ -16,9 +17,11 @@ from ingestion.app.models.email_models import (
 from ingestion.app.services.participant_utils import dedupe_emails, exclude_emails, parse_email_addresses
 from ingestion.app.services.background_tasks import process_email_task
 from ingestion.app.services.dedup_service import build_email_hash, check_and_mark_duplicate
+from ingestion.app.services.thread_identity import derive_thread_id, normalize_message_id
+from ingestion.app.services.thread_memory_service import ThreadMemoryService
 
 
-router = APIRouter(prefix="/api/v1/webhook", tags=["webhook"])
+router = APIRouter(tags=["webhook"])
 
 
 @router.get("/health", summary="Webhook health check", description="Returns service health for webhook ingress.")
@@ -63,6 +66,7 @@ async def receive_email(
     attachments: list[UploadFile] | None = File(default=None),
 ):
     settings = get_settings()
+    thread_memory = ThreadMemoryService()
     _ = attachments
 
     payload = EmailWebhookPayload(
@@ -81,14 +85,38 @@ async def receive_email(
     if await check_and_mark_duplicate(email_hash):
         return DuplicateResponse()
 
+    parsed_headers = message_from_string(headers or "") if headers else message_from_string("")
+    in_reply_to = normalize_message_id(parsed_headers.get("In-Reply-To"))
+    references = parsed_headers.get("References") or ""
+    thread_id = derive_thread_id(payload.message_id, in_reply_to, references)
+
+    participants = dedupe_emails(parse_email_addresses(payload.to) + parse_email_addresses(payload.sender) + parse_email_addresses(payload.cc))
+    participants = exclude_emails(participants, [settings.gmail_sender_email or ""])
+
     text_lower = f"{payload.subject} {payload.text[:200]}".lower()
-    if not any(keyword in text_lower for keyword in settings.accepted_keywords):
+    accepted = any(keyword in text_lower for keyword in settings.accepted_keywords)
+
+    await thread_memory.store_email(
+        message_id=normalize_message_id(payload.message_id),
+        thread_id=thread_id,
+        from_email=payload.sender,
+        to_emails=parse_email_addresses(payload.to),
+        cc_emails=parse_email_addresses(payload.cc),
+        subject=payload.subject,
+        body_text=payload.text,
+        body_html=payload.html,
+        received_at=datetime.now(timezone.utc).isoformat(),
+        email_hash=email_hash,
+        in_reply_to=in_reply_to,
+        references_header=references,
+        processing_status="PENDING" if accepted else "IGNORED",
+        is_read=True,
+    )
+
+    if not accepted:
         return NotSchedulingResponse()
 
     task_id = f"bg_task_{uuid.uuid4().hex[:8]}"
-    participants = dedupe_emails(parse_email_addresses(payload.to) + parse_email_addresses(payload.sender)+parse_email_addresses(payload.cc))
-    participants = exclude_emails(participants, [settings.gmail_sender_email or ""])
-    thread_id = payload.message_id.strip()
 
     background_payload = AgentProcessPayload(
         email_hash=email_hash,
@@ -97,6 +125,8 @@ async def receive_email(
         subject=payload.subject,
         body_text=payload.text,
         thread_id=thread_id,
+        in_reply_to=in_reply_to,
+        references=references,
         participants=participants,
         received_at=datetime.now(timezone.utc).isoformat(),
     )

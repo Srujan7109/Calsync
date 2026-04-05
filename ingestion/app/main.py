@@ -60,6 +60,9 @@ async def lifespan(_: FastAPI):
 
 
 def create_app() -> FastAPI:
+    settings = get_settings()
+    api_prefix = settings.api_v1_prefix.rstrip("/")
+
     app = FastAPI(
         title="Calsync API",
         version="0.1.0",
@@ -70,9 +73,9 @@ def create_app() -> FastAPI:
         openapi_tags=OPENAPI_TAGS,
         lifespan=lifespan,
     )
-    app.include_router(agent_router)
-    app.include_router(webhook_router)
-    app.include_router(imap_router)
+    app.include_router(agent_router, prefix=f"{api_prefix}/agent")
+    app.include_router(webhook_router, prefix=f"{api_prefix}/webhook")
+    app.include_router(imap_router, prefix=f"{api_prefix}/imap")
     return app
 
 

@@ -14,6 +14,7 @@ from ingestion.app.config import get_settings
 from ingestion.app.models.agent_models import AgentProcessResponse, AgentResult
 from ingestion.app.models.email_models import AgentProcessPayload
 from ingestion.app.services.participant_utils import dedupe_emails, exclude_emails, parse_email_addresses
+from ingestion.app.services.thread_memory_service import ThreadMemoryService
 from ingestion.app.services.thread_state_service import ThreadSessionState, ThreadStateService
 
 
@@ -79,6 +80,49 @@ def _collect_participants_from_thread_payload(thread_payload: dict[str, object],
     return participants, replied
 
 
+def _collect_participants_from_thread_rows(thread_rows: list[dict[str, object]], excluded: list[str]) -> tuple[list[str], list[str]]:
+    participants: list[str] = []
+    replied: list[str] = []
+
+    for row in thread_rows:
+        from_email = str(row.get("from_email") or "")
+        to_emails = row.get("to_emails") if isinstance(row.get("to_emails"), list) else []
+        cc_emails = row.get("cc_emails") if isinstance(row.get("cc_emails"), list) else []
+
+        participants.extend(parse_email_addresses(from_email))
+        participants.extend(parse_email_addresses(",".join(str(value) for value in to_emails)))
+        participants.extend(parse_email_addresses(",".join(str(value) for value in cc_emails)))
+
+        sender = parse_email_addresses(from_email)
+        if sender:
+            replied.extend(sender)
+
+    participants = exclude_emails(dedupe_emails(participants), excluded)
+    replied = exclude_emails(dedupe_emails(replied), excluded)
+    return participants, replied
+
+
+def _build_thread_context(thread_rows: list[dict[str, object]], max_messages: int = 8) -> str:
+    if not thread_rows:
+        return ""
+
+    context_lines: list[str] = []
+    for index, row in enumerate(thread_rows[-max_messages:], 1):
+        direction = str(row.get("direction") or "INBOUND")
+        role = "CalSync → Participant" if direction == "OUTBOUND" else "Participant → CalSync"
+        from_email = str(row.get("from_email") or "")
+        subject = str(row.get("subject") or "")
+        body_preview = str(row.get("body_text") or "").strip()[:1000]
+        context_lines.append(
+            f"[{index}] {role}\n"
+            f"From: {from_email}\n"
+            f"Subject: {subject}\n"
+            f"Body: {body_preview}"
+        )
+
+    return "\n\n".join(context_lines)
+
+
 def _parse_iso_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -97,7 +141,7 @@ def _should_send_reminder(last_reminder_at: str | None, cooldown_minutes: int) -
     return datetime.now(timezone.utc) - last >= timedelta(minutes=max(cooldown_minutes, 1))
 
 
-async def _analyze_email_with_gemini(payload: AgentProcessPayload) -> dict[str, Any]:
+async def _analyze_email_with_gemini(payload: AgentProcessPayload, thread_context: str = "") -> dict[str, Any]:
     settings = get_settings()
     default_action = "SENT_AVAILABILITY_REQUEST" if _looks_like_new_meeting(payload.subject, payload.body_text) else "NO_ACTION"
     default_reasoning = "Thought: deterministic scheduling intent check. Action: fallback pipeline."
@@ -141,6 +185,8 @@ async def _analyze_email_with_gemini(payload: AgentProcessPayload) -> dict[str, 
         current_time=datetime.now(timezone.utc).isoformat(),
         body=payload.body_text[:2000],
     )
+    if thread_context:
+        prompt = f"{prompt}\n\nThread Context:\n{thread_context}"
     client = gemini_module.Client(api_key=settings.gemini_api_key)
 
     # Retry with exponential backoff on 429 rate-limit errors
@@ -203,10 +249,20 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
     tools = CalsyncTools()
     settings = get_settings()
     thread_service = ThreadStateService()
+    thread_memory = ThreadMemoryService()
 
     thread_id = payload.thread_id.strip() or payload.message_id
     excluded = dedupe_emails([settings.gmail_sender_email or "", payload.from_email])
     recipients = _normalize_recipients(payload)
+
+    thread_rows = []
+    thread_context = ""
+    if thread_id:
+        try:
+            thread_rows = await thread_memory.get_thread_emails(thread_id)
+            thread_context = _build_thread_context(thread_rows)
+        except Exception as exc:  # pragma: no cover - external dependency safety
+            logger.warning("Thread memory lookup skipped: %s", exc)
 
     session = ThreadSessionState(
         session_id=f"sess_{uuid.uuid4().hex[:8]}",
@@ -218,18 +274,17 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
         replied_participants=[],
         last_reminder_at=None,
     )
-    if settings.thread_intelligence_enabled:
-        try:
-            session = await thread_service.get_or_create_session(
-                thread_id=thread_id,
-                organizer_email=payload.from_email,
-                meeting_title=payload.subject or "Meeting",
-                participants=recipients,
-            )
-        except Exception as exc:  # pragma: no cover - external dependency safety
-            logger.warning("Thread session restore skipped: %s", exc)
+    try:
+        session = await thread_service.get_or_create_session(
+            thread_id=thread_id,
+            organizer_email=payload.from_email,
+            meeting_title=payload.subject or "Meeting",
+            participants=recipients,
+        )
+    except Exception as exc:  # pragma: no cover - external dependency safety
+        logger.warning("Thread session restore skipped: %s", exc)
 
-    analysis = await _analyze_email_with_gemini(payload)
+    analysis = await _analyze_email_with_gemini(payload, thread_context=thread_context)
     action = str(analysis.get("action") or "NO_ACTION")
     reasoning_trace = str(analysis.get("reasoning_trace") or "Thought: no-op.")
     meeting_title = str(analysis.get("title") or payload.subject or "Meeting coordination")
@@ -246,10 +301,18 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
     replied_pool = dedupe_emails(session.replied_participants + [payload.from_email])
     replied_pool = exclude_emails(replied_pool, [settings.gmail_sender_email or ""])
 
-    if settings.thread_intelligence_enabled and thread_id and thread_id != payload.message_id:
+    if thread_rows:
+        thread_participants, thread_replied = _collect_participants_from_thread_rows(thread_rows, excluded)
+        previous_count = len(set(email.lower() for email in participant_pool))
+        participant_pool = dedupe_emails(participant_pool + thread_participants)
+        replied_pool = dedupe_emails(replied_pool + thread_replied)
+        if len(set(email.lower() for email in participant_pool)) > previous_count:
+            reasoning_trace = f"{reasoning_trace} Observation: thread_history_loaded."
+
+    if thread_id and thread_id != payload.message_id and not thread_rows:
         thread_outcome = await tools.fetch_thread(thread_id=thread_id)
         reasoning_trace = f"{reasoning_trace} Tool: fetch_thread={thread_outcome.status}."
-        if thread_outcome.status == "OK":
+        if thread_outcome.status == "OK" and not thread_rows:
             thread_participants, thread_replied = _collect_participants_from_thread_payload(thread_outcome.payload, excluded)
             previous_count = len(set(email.lower() for email in participant_pool))
             participant_pool = dedupe_emails(participant_pool + thread_participants)
@@ -290,8 +353,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
         # FIX 3: Only send reminders AFTER initial availability request has gone out
         # and the cooldown has passed (session is already in AWAITING_REPLIES state)
         if (
-            settings.thread_intelligence_enabled
-            and session.status == "AWAITING_REPLIES"
+            session.status == "AWAITING_REPLIES"
             and pending_participants
             and _should_send_reminder(session.last_reminder_at, settings.reminder_cooldown_minutes)
         ):
@@ -311,7 +373,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
 
     elif action == "BOOKED_CALENDAR":
         # Guard: don't book if session is already BOOKED
-        if settings.thread_intelligence_enabled and session.status == "BOOKED":
+        if session.status == "BOOKED":
             logger.info(
                 "Session %s already BOOKED — skipping duplicate booking for thread %s",
                 session_id, thread_id
@@ -374,18 +436,38 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                 )
 
                 if not slot_is_free:
-                    action = "SENT_AVAILABILITY_REQUEST"
-                    request_body = "The suggested slot appears busy for at least one participant. Please share alternatives."
-                    gmail_outcome = await tools.send_gmail_message(
-                        recipients=participant_pool,
-                        subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
-                        body_text=request_body,
-                        thread_id=thread_id,
-                        session_id=session_id,
-                    )
-                    reasoning_trace = (
-                        f"{reasoning_trace} Tool: slot_conflicted. Tool: send_gmail_message={gmail_outcome.status}."
-                    )
+                    if pending_participants:
+                        action = "SENT_AVAILABILITY_REQUEST"
+                        request_body = "The suggested slot appears busy for at least one participant. Please share alternatives."
+                        gmail_outcome = await tools.send_gmail_message(
+                            recipients=participant_pool,
+                            subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
+                            body_text=request_body,
+                            thread_id=thread_id,
+                            session_id=session_id,
+                        )
+                        reasoning_trace = (
+                            f"{reasoning_trace} Tool: slot_conflicted. Tool: send_gmail_message={gmail_outcome.status}."
+                        )
+                    else:
+                        session.status = "NO_OVERLAP"
+                        no_overlap_body = (
+                            "We could not find a common available slot for everyone. "
+                            "Please share more time options and I will try again."
+                        )
+                        gmail_outcome = await tools.send_gmail_message(
+                            recipients=participant_pool,
+                            subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
+                            body_text=no_overlap_body,
+                            thread_id=thread_id,
+                            session_id=session_id,
+                        )
+                        action = "NO_ACTION"
+                        reasoning_trace = (
+                            f"{reasoning_trace} Observation: no_overlap_detected. "
+                            f"Tool: send_gmail_message={gmail_outcome.status}."
+                        )
+                        pending_participants = []
                 else:
                     calendar_outcome = await tools.book_calendar(
                         title=meeting_title,
@@ -398,21 +480,39 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
 
                     if calendar_outcome.status == "OK":
                         session.status = "BOOKED"
+                    elif calendar_outcome.status == "ALL_SLOTS_CONFLICTED":
+                        session.status = "NO_OVERLAP"
+                        no_overlap_body = (
+                            "We tried the available options but could not find a common overlap. "
+                            "Please share more time slots and I will try booking again."
+                        )
+                        gmail_outcome = await tools.send_gmail_message(
+                            recipients=participant_pool,
+                            subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
+                            body_text=no_overlap_body,
+                            thread_id=thread_id,
+                            session_id=session_id,
+                        )
+                        action = "NO_ACTION"
+                        reasoning_trace = (
+                            f"{reasoning_trace} Observation: all_slots_conflicted. "
+                            f"Tool: send_gmail_message={gmail_outcome.status}."
+                        )
+                    else:
+                        confirmation_body = (
+                            "Your meeting has been coordinated and added to the calendar. "
+                            f"Slot: {calendar_slot['start']} to {calendar_slot['end']} (UTC)."
+                        )
+                        gmail_outcome = await tools.send_gmail_message(
+                            recipients=participant_pool,
+                            subject=f"Calendar confirmed: {meeting_title}",
+                            body_text=confirmation_body,
+                            thread_id=thread_id,
+                            session_id=session_id,
+                        )
+                        reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
 
-                    confirmation_body = (
-                        "Your meeting has been coordinated and added to the calendar. "
-                        f"Slot: {calendar_slot['start']} to {calendar_slot['end']} (UTC)."
-                    )
-                    gmail_outcome = await tools.send_gmail_message(
-                        recipients=participant_pool,
-                        subject=f"Calendar confirmed: {meeting_title}",
-                        body_text=confirmation_body,
-                        thread_id=thread_id,
-                        session_id=session_id,
-                    )
-                    reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
-
-    if session.status != "BOOKED":
+    if session.status not in ("BOOKED", "NO_OVERLAP"):
         if pending_participants:
             session.status = "AWAITING_REPLIES"
         else:
@@ -423,11 +523,10 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
     if reminders_sent:
         session.last_reminder_at = datetime.now(timezone.utc).isoformat()
 
-    if settings.thread_intelligence_enabled:
-        try:
-            await thread_service.persist_state(session)
-        except Exception as exc:  # pragma: no cover - external dependency safety
-            logger.warning("Thread session persistence skipped: %s", exc)
+    try:
+        await thread_service.persist_state(session)
+    except Exception as exc:  # pragma: no cover - external dependency safety
+        logger.warning("Thread session persistence skipped: %s", exc)
 
     return AgentProcessResponse(
         agent_result=AgentResult(

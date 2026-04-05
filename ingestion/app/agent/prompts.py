@@ -13,7 +13,9 @@ Rules:
 2) Use BOOKED_CALENDAR only when a concrete slot exists in the email.
 3) If scheduling is requested but slot is unclear, choose SENT_AVAILABILITY_REQUEST.
 4) If the email is unrelated to scheduling, choose NO_ACTION.
-5) Assume all times are in Indian Standard Time (IST). Do not ask users for their timezone. Convert and output all start_iso and end_iso time slots to UTC string format mathematically (ending in Z).
+5) Do not assume a default timezone.
+6) If a timezone is explicitly present (for example IST, UTC, GMT, PST, EDT, Asia/Kolkata, etc.), convert start_iso and end_iso to UTC format ending in Z.
+7) If timezone is missing or ambiguous, do NOT choose BOOKED_CALENDAR. Choose SENT_AVAILABILITY_REQUEST and ask the sender to confirm timezone.
 
 Subject: {subject}
 From: {from_email}

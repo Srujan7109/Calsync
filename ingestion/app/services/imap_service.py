@@ -8,6 +8,7 @@ from email.message import Message
 from typing import Iterable
 
 from ingestion.app.config import Settings
+from ingestion.app.services.thread_identity import derive_thread_id, normalize_message_id
 
 
 @dataclass(slots=True)
@@ -18,6 +19,9 @@ class ImapEmail:
     subject: str
     body_text: str
     message_id: str
+    thread_id: str
+    in_reply_to: str
+    references: str
 
 
 def _decode_header_value(value: str | None) -> str:
@@ -101,6 +105,8 @@ def fetch_emails(settings: Settings, limit: int = 20) -> list[ImapEmail]:
             cc_value = _decode_header_value(parsed.get("Cc"))
             subject_value = _decode_header_value(parsed.get("Subject"))
             message_id = _decode_header_value(parsed.get("Message-ID"))
+            in_reply_to = _decode_header_value(parsed.get("In-Reply-To"))
+            references = _decode_header_value(parsed.get("References"))
             body_text = _extract_text_from_message(parsed)
 
             emails.append(
@@ -110,14 +116,17 @@ def fetch_emails(settings: Settings, limit: int = 20) -> list[ImapEmail]:
                     cc=cc_value,
                     subject=subject_value,
                     body_text=body_text,
-                    message_id=message_id,
+                    message_id=normalize_message_id(message_id),
+                    thread_id=derive_thread_id(message_id, in_reply_to, references),
+                    in_reply_to=normalize_message_id(in_reply_to),
+                    references=references,
                 )
             )
 
-        try:
-            mail.store(uid, "+FLAGS", "\\Seen")
-        except Exception:
-            pass
+            try:
+                mail.store(uid, "+FLAGS", "\\Seen")
+            except Exception:
+                pass
 
         return emails
     finally:

@@ -7,7 +7,7 @@ from ingestion.app.models.agent_models import AgentProcessResponse
 from ingestion.app.models.email_models import AgentProcessPayload
 
 
-router = APIRouter(prefix="/api/v1/agent", tags=["agent"])
+router = APIRouter(tags=["agent"])
 
 
 @router.post(
