@@ -157,7 +157,12 @@ async def send_email(req: SendEmailRequest) -> Dict[str, Any]:
         intent = _subject_intent(req.subject)
         if intent:
             try:
-                existing = get_outbound_emails_for_session(req.session_id, intent)
+                existing = get_outbound_emails_for_session(
+                    req.session_id,
+                    intent,
+                    subject=req.subject,
+                    body_text=req.body_text,
+                )
                 if existing:
                     logger.info(
                         "send_email: dedup skip — session %s already has %d "

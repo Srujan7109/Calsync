@@ -30,7 +30,14 @@ class CalsyncTools:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(endpoint, json=body)
                 response.raise_for_status()
-                return ToolCallOutcome(name=tool_name, status="OK", payload=response.json())
+                payload = response.json()
+                if isinstance(payload, dict):
+                    return ToolCallOutcome(
+                        name=tool_name,
+                        status=str(payload.get("status") or "OK"),
+                        payload=payload,
+                    )
+                return ToolCallOutcome(name=tool_name, status="OK", payload={"response": payload})
         except Exception as exc:  # pragma: no cover - network/runtime safety
             return ToolCallOutcome(name=tool_name, status="ERROR", payload={"error": str(exc)})
 
@@ -86,6 +93,7 @@ class CalsyncTools:
         title: str,
         participants: list[str],
         slot: dict[str, str],
+        fallback_slots: list[dict[str, str]] | None,
         organizer_email: str,
         session_id: str,
     ) -> ToolCallOutcome:
@@ -100,7 +108,7 @@ class CalsyncTools:
             "participants": participants,
             "organizer_email": organizer_email,
             "description": "Coordinated by CalSync.ai",
-            "fallback_slots": [],
+            "fallback_slots": fallback_slots or [],
             "session_id": session_id,
         }
         return await self._post_json(endpoint, body, "book_calendar")

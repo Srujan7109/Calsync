@@ -141,6 +141,56 @@ def _should_send_reminder(last_reminder_at: str | None, cooldown_minutes: int) -
     return datetime.now(timezone.utc) - last >= timedelta(minutes=max(cooldown_minutes, 1))
 
 
+def _normalize_utc_slot(slot: dict[str, Any]) -> tuple[str, str] | None:
+    start_raw = str(slot.get("start_iso") or "").strip()
+    end_raw = str(slot.get("end_iso") or "").strip()
+    if not start_raw or not end_raw:
+        return None
+
+    def _to_utc_z(value: str) -> str | None:
+        normalized = value.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return None
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    start_utc = _to_utc_z(start_raw)
+    end_utc = _to_utc_z(end_raw)
+    if not start_utc or not end_utc:
+        return None
+    return start_utc, end_utc
+
+
+def _extract_candidate_slots(analysis: dict[str, Any]) -> list[dict[str, str]]:
+    raw_candidates: list[dict[str, Any]] = []
+
+    primary_slot = analysis.get("slot")
+    if isinstance(primary_slot, dict):
+        raw_candidates.append(primary_slot)
+
+    for key in ("slot_candidates", "slots"):
+        value = analysis.get(key)
+        if isinstance(value, list):
+            raw_candidates.extend(item for item in value if isinstance(item, dict))
+
+    normalized_candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in raw_candidates:
+        normalized = _normalize_utc_slot(candidate)
+        if not normalized:
+            continue
+        key = (normalized[0], normalized[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_candidates.append({"start": normalized[0], "end": normalized[1]})
+
+    return normalized_candidates
+
+
 async def _analyze_email_with_gemini(payload: AgentProcessPayload, thread_context: str = "") -> dict[str, Any]:
     settings = get_settings()
     default_action = "SENT_AVAILABILITY_REQUEST" if _looks_like_new_meeting(payload.subject, payload.body_text) else "NO_ACTION"
@@ -159,6 +209,7 @@ async def _analyze_email_with_gemini(payload: AgentProcessPayload, thread_contex
             "reasoning_trace": default_reasoning,
             "request_email_body": "Could you please share your preferred time slots and timezone?",
             "slot": None,
+            "slot_candidates": [],
         }
 
     try:
@@ -176,6 +227,7 @@ async def _analyze_email_with_gemini(payload: AgentProcessPayload, thread_contex
             "reasoning_trace": default_reasoning,
             "request_email_body": "Could you please share your preferred time slots and timezone?",
             "slot": None,
+            "slot_candidates": [],
         }
 
     prompt = AGENT_ANALYSIS_PROMPT.format(
@@ -218,10 +270,35 @@ async def _analyze_email_with_gemini(payload: AgentProcessPayload, thread_contex
                 "reasoning_trace": f"Thought: Gemini unavailable ({exc}). Action: deterministic fallback.",
                 "request_email_body": "Could you please share your preferred time slot?",
                 "slot": None,
+                "slot_candidates": [],
             }
 
     output_text = getattr(response, "text", "") or "" if response else ""
     parsed = _extract_json_payload(output_text)
+    format_retry_limit = 2
+    format_retry_instruction = (
+        "\n\nIMPORTANT: Return ONLY one valid JSON object. "
+        "No markdown, no explanation, no surrounding text."
+    )
+    for format_attempt in range(format_retry_limit):
+        if parsed is not None:
+            break
+        logger.warning(
+            "Gemini returned invalid JSON (attempt %d/%d) — retrying with strict JSON instruction",
+            format_attempt + 1,
+            format_retry_limit,
+        )
+        try:
+            repair_response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=settings.gemini_model,
+                contents=f"{prompt}{format_retry_instruction}",
+            )
+            output_text = getattr(repair_response, "text", "") or ""
+            parsed = _extract_json_payload(output_text)
+        except Exception as exc:
+            logger.warning("Gemini JSON repair attempt failed: %s", exc)
+
     if parsed is None:
         logger.info(
             "Agent decision source=fallback reason=invalid_gemini_json subject=%s from=%s action=%s",
@@ -235,6 +312,7 @@ async def _analyze_email_with_gemini(payload: AgentProcessPayload, thread_contex
             "reasoning_trace": "Thought: invalid Gemini JSON response. Action: deterministic fallback.",
             "request_email_body": "Could you please share your preferred time slots and timezone?",
             "slot": None,
+            "slot_candidates": [],
         }
     logger.info(
         "Agent decision source=gemini subject=%s from=%s action=%s",
@@ -289,9 +367,25 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
     reasoning_trace = str(analysis.get("reasoning_trace") or "Thought: no-op.")
     meeting_title = str(analysis.get("title") or payload.subject or "Meeting coordination")
     session_id = session.session_id or f"sess_{uuid.uuid4().hex[:8]}"
+    sent_recipients: list[str] = []
+
+    def _record_sent_recipients(outcome_status: str, recipients_list: list[str]) -> None:
+        if outcome_status == "OK":
+            sent_recipients.extend(recipients_list)
+
+    slot_from_analysis = analysis.get("slot") if isinstance(analysis.get("slot"), dict) else {}
+    if (
+        session.status == "NO_OVERLAP"
+        and slot_from_analysis.get("start_iso")
+        and slot_from_analysis.get("end_iso")
+        and action == "SENT_AVAILABILITY_REQUEST"
+    ):
+        action = "BOOKED_CALENDAR"
+        reasoning_trace = f"{reasoning_trace} Observation: retry_booking_after_no_overlap."
 
     session.meeting_title = meeting_title
-    session.organizer_email = payload.from_email
+    if not session.organizer_email:
+        session.organizer_email = payload.from_email
 
     # Build participant pool: always restore full list from persisted session state
     participant_pool = dedupe_emails(session.participants + recipients + [payload.from_email])
@@ -348,6 +442,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
             thread_id=thread_id,
             session_id=session_id,
         )
+        _record_sent_recipients(gmail_outcome.status, participant_pool)
         reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
 
         # FIX 3: Only send reminders AFTER initial availability request has gone out
@@ -368,6 +463,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                 thread_id=thread_id,
                 session_id=session_id,
             )
+            _record_sent_recipients(reminder_outcome.status, pending_participants)
             reminders_sent = reminder_outcome.status == "OK"
             reasoning_trace = f"{reasoning_trace} Tool: reminder_email={reminder_outcome.status}."
 
@@ -405,14 +501,17 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                 thread_id=thread_id,
                 session_id=session_id,
             )
+            _record_sent_recipients(gmail_outcome.status, pending_participants)
             reasoning_trace = f"{reasoning_trace} Tool: waiting_for_participants={gmail_outcome.status}."
         else:
-            slot = analysis.get("slot") if isinstance(analysis.get("slot"), dict) else {}
-            calendar_slot = {"start": str(slot.get("start_iso") or ""), "end": str(slot.get("end_iso") or "")}
+            candidate_slots = _extract_candidate_slots(analysis)
 
-            if not calendar_slot["start"] or not calendar_slot["end"]:
+            if not candidate_slots:
                 action = "SENT_AVAILABILITY_REQUEST"
-                request_body = "Please let me know a time slot so I can book the meeting."
+                request_body = (
+                    "Please share a concrete time slot with timezone (for example, "
+                    "2026-04-08 15:00 IST or 2026-04-08T09:30:00Z) so I can book the meeting."
+                )
                 gmail_outcome = await tools.send_gmail_message(
                     recipients=participant_pool,
                     subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
@@ -420,59 +519,61 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                     thread_id=thread_id,
                     session_id=session_id,
                 )
+                _record_sent_recipients(gmail_outcome.status, participant_pool)
                 reasoning_trace = (
-                    f"{reasoning_trace} Tool: missing_slot_data. Tool: send_gmail_message={gmail_outcome.status}."
+                    f"{reasoning_trace} Tool: missing_or_ambiguous_timezone_slot_data. "
+                    f"Tool: send_gmail_message={gmail_outcome.status}."
                 )
             else:
-                freebusy_outcome = await tools.check_freebusy(participants=participant_pool, slot=calendar_slot)
-                reasoning_trace = f"{reasoning_trace} Tool: check_freebusy={freebusy_outcome.status}."
+                selected_slot: dict[str, str] | None = None
+                selected_index = -1
 
-                freebusy_results = freebusy_outcome.payload.get("results")
-                slot_is_free = bool(
-                    isinstance(freebusy_results, list)
-                    and freebusy_results
-                    and isinstance(freebusy_results[0], dict)
-                    and freebusy_results[0].get("is_free") is True
-                )
+                for index, candidate_slot in enumerate(candidate_slots):
+                    freebusy_outcome = await tools.check_freebusy(participants=participant_pool, slot=candidate_slot)
+                    reasoning_trace = (
+                        f"{reasoning_trace} Tool: check_freebusy[{index + 1}/{len(candidate_slots)}]="
+                        f"{freebusy_outcome.status}."
+                    )
 
-                if not slot_is_free:
-                    if pending_participants:
-                        action = "SENT_AVAILABILITY_REQUEST"
-                        request_body = "The suggested slot appears busy for at least one participant. Please share alternatives."
-                        gmail_outcome = await tools.send_gmail_message(
-                            recipients=participant_pool,
-                            subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
-                            body_text=request_body,
-                            thread_id=thread_id,
-                            session_id=session_id,
-                        )
-                        reasoning_trace = (
-                            f"{reasoning_trace} Tool: slot_conflicted. Tool: send_gmail_message={gmail_outcome.status}."
-                        )
-                    else:
-                        session.status = "NO_OVERLAP"
-                        no_overlap_body = (
-                            "We could not find a common available slot for everyone. "
-                            "Please share more time options and I will try again."
-                        )
-                        gmail_outcome = await tools.send_gmail_message(
-                            recipients=participant_pool,
-                            subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
-                            body_text=no_overlap_body,
-                            thread_id=thread_id,
-                            session_id=session_id,
-                        )
-                        action = "NO_ACTION"
-                        reasoning_trace = (
-                            f"{reasoning_trace} Observation: no_overlap_detected. "
-                            f"Tool: send_gmail_message={gmail_outcome.status}."
-                        )
-                        pending_participants = []
+                    freebusy_results = freebusy_outcome.payload.get("results")
+                    slot_is_free = bool(
+                        isinstance(freebusy_results, list)
+                        and freebusy_results
+                        and isinstance(freebusy_results[0], dict)
+                        and freebusy_results[0].get("is_free") is True
+                    )
+                    if slot_is_free:
+                        selected_slot = candidate_slot
+                        selected_index = index
+                        break
+
+                if not selected_slot:
+                    session.status = "NO_OVERLAP"
+                    no_overlap_body = (
+                        f"We checked all {len(candidate_slots)} shared time option(s), but none were free for everyone. "
+                        "Please share more time options and I will try again."
+                    )
+                    gmail_outcome = await tools.send_gmail_message(
+                        recipients=participant_pool,
+                        subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
+                        body_text=no_overlap_body,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                    )
+                    _record_sent_recipients(gmail_outcome.status, participant_pool)
+                    action = "NO_ACTION"
+                    reasoning_trace = (
+                        f"{reasoning_trace} Observation: no_overlap_detected_after_all_candidates. "
+                        f"Tool: send_gmail_message={gmail_outcome.status}."
+                    )
+                    pending_participants = []
                 else:
+                    fallback_slots = candidate_slots[selected_index + 1 :]
                     calendar_outcome = await tools.book_calendar(
                         title=meeting_title,
                         participants=participant_pool,
-                        slot=calendar_slot,
+                        slot=selected_slot,
+                        fallback_slots=fallback_slots,
                         organizer_email=payload.from_email,
                         session_id=session_id,
                     )
@@ -480,6 +581,19 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
 
                     if calendar_outcome.status == "OK":
                         session.status = "BOOKED"
+                        confirmation_body = (
+                            "Your meeting has been coordinated and added to the calendar. "
+                            f"Slot: {selected_slot['start']} to {selected_slot['end']} (UTC)."
+                        )
+                        gmail_outcome = await tools.send_gmail_message(
+                            recipients=participant_pool,
+                            subject=f"Calendar confirmed: {meeting_title}",
+                            body_text=confirmation_body,
+                            thread_id=thread_id,
+                            session_id=session_id,
+                        )
+                        _record_sent_recipients(gmail_outcome.status, participant_pool)
+                        reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
                     elif calendar_outcome.status == "ALL_SLOTS_CONFLICTED":
                         session.status = "NO_OVERLAP"
                         no_overlap_body = (
@@ -493,24 +607,30 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                             thread_id=thread_id,
                             session_id=session_id,
                         )
+                        _record_sent_recipients(gmail_outcome.status, participant_pool)
                         action = "NO_ACTION"
                         reasoning_trace = (
                             f"{reasoning_trace} Observation: all_slots_conflicted. "
                             f"Tool: send_gmail_message={gmail_outcome.status}."
                         )
                     else:
-                        confirmation_body = (
-                            "Your meeting has been coordinated and added to the calendar. "
-                            f"Slot: {calendar_slot['start']} to {calendar_slot['end']} (UTC)."
+                        action = "SENT_AVAILABILITY_REQUEST"
+                        failure_body = (
+                            "I could not complete booking due to a temporary calendar issue. "
+                            "Please share alternative slots and I will retry."
                         )
                         gmail_outcome = await tools.send_gmail_message(
                             recipients=participant_pool,
-                            subject=f"Calendar confirmed: {meeting_title}",
-                            body_text=confirmation_body,
+                            subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
+                            body_text=failure_body,
                             thread_id=thread_id,
                             session_id=session_id,
                         )
-                        reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
+                        _record_sent_recipients(gmail_outcome.status, participant_pool)
+                        reasoning_trace = (
+                            f"{reasoning_trace} Observation: calendar_booking_error. "
+                            f"Tool: send_gmail_message={gmail_outcome.status}."
+                        )
 
     if session.status not in ("BOOKED", "NO_OVERLAP"):
         if pending_participants:
@@ -532,7 +652,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
         agent_result=AgentResult(
             action_taken=action,
             session_id=session_id,
-            emails_sent_to=recipients,
+            emails_sent_to=dedupe_emails(sent_recipients),
             reasoning_trace=reasoning_trace,
         )
     )

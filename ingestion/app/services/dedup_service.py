@@ -13,7 +13,9 @@ _memory_store: dict[str, datetime] = {}
 
 
 def build_email_hash(sender: str, message_id: str) -> str:
-    return hashlib.sha256(f"{sender}:{message_id}".encode("utf-8")).hexdigest()
+    normalized_sender = (sender or "").strip().lower()
+    normalized_message_id = (message_id or "").strip()
+    return hashlib.sha256(f"{normalized_sender}:{normalized_message_id}".encode("utf-8")).hexdigest()
 
 
 def _memory_check_and_mark(email_hash: str, ttl_seconds: int, now: datetime) -> bool:

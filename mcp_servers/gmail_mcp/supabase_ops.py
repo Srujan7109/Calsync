@@ -9,7 +9,7 @@ This is the single access layer between the application and Supabase.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional
 
 from supabase import create_client, Client
@@ -125,6 +125,9 @@ def get_thread_emails(thread_id: str) -> List[dict]:
 def get_outbound_emails_for_session(
     session_id: str,
     intent_type: Optional[str] = None,
+    subject: Optional[str] = None,
+    body_text: Optional[str] = None,
+    lookback_minutes: int = 30,
 ) -> List[dict]:
     """
     Return OUTBOUND emails already sent for this scheduling session.
@@ -145,14 +148,20 @@ def get_outbound_emails_for_session(
         RuntimeError: If the Supabase query fails.
     """
     try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(lookback_minutes, 1))
         query = (
             supabase.table("emails")
             .select("id, subject, received_at")
             .eq("session_id", session_id)
             .eq("direction", "OUTBOUND")
+            .gte("received_at", cutoff.isoformat())
         )
         if intent_type:
             query = query.ilike("subject", f"%{intent_type}%")
+        if subject:
+            query = query.eq("subject", subject)
+        if body_text:
+            query = query.eq("body_text", body_text)
         response = query.order("received_at", desc=False).execute()
         return response.data or []
     except Exception as exc:

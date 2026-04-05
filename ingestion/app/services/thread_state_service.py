@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -7,6 +8,10 @@ from datetime import datetime, timezone
 import httpx
 
 from ingestion.app.config import get_settings
+
+
+_LOCAL_SESSION_STORE: dict[str, ThreadSessionState] = {}
+_LOCAL_SESSION_LOCK = threading.Lock()
 
 
 @dataclass(slots=True)
@@ -53,16 +58,40 @@ class ThreadStateService:
     ) -> ThreadSessionState:
         initial_participants = participants or []
         if not self._enabled():
-            return ThreadSessionState(
-                session_id=f"sess_{uuid.uuid4().hex[:8]}",
-                thread_id=thread_id,
-                status="AWAITING_REPLIES",
-                organizer_email=organizer_email,
-                meeting_title=meeting_title,
-                participants=initial_participants,
-                replied_participants=[],
-                last_reminder_at=None,
-            )
+            with _LOCAL_SESSION_LOCK:
+                existing = _LOCAL_SESSION_STORE.get(thread_id)
+                if existing:
+                    merged_participants = list(
+                        dict.fromkeys(
+                            [p for p in existing.participants if p]
+                            + [p for p in initial_participants if p]
+                        )
+                    )
+                    restored = ThreadSessionState(
+                        session_id=existing.session_id,
+                        thread_id=thread_id,
+                        status=existing.status,
+                        organizer_email=existing.organizer_email or organizer_email,
+                        meeting_title=existing.meeting_title or meeting_title,
+                        participants=merged_participants,
+                        replied_participants=list(existing.replied_participants),
+                        last_reminder_at=existing.last_reminder_at,
+                    )
+                    _LOCAL_SESSION_STORE[thread_id] = restored
+                    return restored
+
+                session = ThreadSessionState(
+                    session_id=f"sess_{uuid.uuid4().hex[:8]}",
+                    thread_id=thread_id,
+                    status="AWAITING_REPLIES",
+                    organizer_email=organizer_email,
+                    meeting_title=meeting_title,
+                    participants=initial_participants,
+                    replied_participants=[],
+                    last_reminder_at=None,
+                )
+                _LOCAL_SESSION_STORE[thread_id] = session
+                return session
 
         session_row = await self._get_session_by_thread(thread_id)
         if not session_row:
@@ -115,6 +144,8 @@ class ThreadStateService:
 
     async def persist_state(self, state: ThreadSessionState) -> None:
         if not self._enabled():
+            with _LOCAL_SESSION_LOCK:
+                _LOCAL_SESSION_STORE[state.thread_id] = state
             return
         await self._upsert_session_row(
             session_id=state.session_id,
