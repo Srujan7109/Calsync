@@ -19,6 +19,10 @@ from ingestion.app.services.thread_state_service import ThreadSessionState, Thre
 
 logger = logging.getLogger("uvicorn.error")
 IST = timezone(timedelta(hours=5, minutes=30))
+SYSTEM_SENDERS = {
+    "calendar-notification@google.com",
+    "calendar-notification@googlemail.com",
+}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -219,6 +223,13 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
             reasoning_trace="Skipped own outbound email.",
         ))
 
+    # Ignore provider-generated calendar/system messages.
+    if sender in SYSTEM_SENDERS or sender.startswith("no-reply"):
+        return AgentProcessResponse(agent_result=AgentResult(
+            action_taken="NO_ACTION", session_id="", emails_sent_to=[],
+            reasoning_trace=f"Ignored system sender: {sender}",
+        ))
+
     inbound_people = exclude_emails(
         dedupe_emails(payload.participants + [payload.from_email]), [calsync]
     )
@@ -399,17 +410,25 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
             if missing_slots:
                 # Some participants replied but we could not extract clear slots yet.
                 await tools.send_gmail_message(
-                    recipients=[session.organizer_email],
-                    subject=f"Need more availability details — {meeting_title}",
+                    recipients=missing_slots,
+                    subject=f"Need specific times — {meeting_title}",
                     body_text=(
-                        f"All participants have responded for '{meeting_title}', but I couldn't extract "
-                        f"specific time slots for: {', '.join(missing_slots)}.\n\n"
-                        "Could you ask them to reply with explicit dates/times in IST?\n\n"
+                        f"Hi,\n\n"
+                        f"I could not extract clear time slots for '{meeting_title}' from your last reply.\n\n"
+                        "Please reply with explicit dates and times in IST, for example:\n"
+                        "'Tue 3:00 PM to 5:00 PM IST'\n\n"
+                        "Thank you!\n\nCalSync.ai\n\n"
                         f"[calsync-ref:{session_id}]"
                     ),
                     thread_id="", session_id=session_id,
                 )
-                trace += f" Missing/unclear slots for {missing_slots}. Asked organizer to clarify."
+                # Wait only for participants whose slots are still missing.
+                replied = [p for p in all_p if p not in missing_slots]
+                replied_set = {e.lower() for e in replied}
+                pending = [p for p in all_p if p.lower() not in replied_set]
+                session.status = "AWAITING_REPLIES"
+                session.last_reminder_at = _now_iso()
+                trace += f" Missing/unclear slots for {missing_slots}. Requested explicit times."
             else:
                 # Compute overlap
                 overlapping = _compute_overlap(slots_by_participant, duration_minutes=60)
@@ -505,6 +524,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                             "The best overlapping time is already blocked on the calendar.")
                         session.status = "AWAITING_REPLIES"
                         replied = []
+                        pending = list(all_p)
                         session.last_reminder_at = _now_iso()
                         trace += " Calendar conflict on best slot. Asked for alternatives."
 
@@ -532,6 +552,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                         )
                     # Reset so everyone must reply again
                     replied = []
+                    pending = list(all_p)
                     session.last_reminder_at = _now_iso()
                     session.status = "AWAITING_REPLIES"
                     trace += " No overlap. Asked all for more availability."
@@ -559,7 +580,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                 trace += " Cooldown active. No reminder."
 
     # ── Persist ───────────────────────────────────────────────────────────────
-    if session.status != "BOOKED":
+    if session.status not in ("BOOKED", "CANCELLED"):
         session.status = "AWAITING_REPLIES" if pending else "READY_TO_COMPUTE"
     session.participants = all_p
     session.replied_participants = replied

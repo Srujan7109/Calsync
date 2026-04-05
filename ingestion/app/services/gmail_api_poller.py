@@ -48,7 +48,13 @@ async def fetch_and_queue_gmail_messages(
 
         email_hash = build_email_hash(from_email, message_id)
 
-        if await check_and_mark_duplicate(email_hash):
+        try:
+            is_duplicate = await check_and_mark_duplicate(email_hash)
+        except Exception as exc:
+            logger.warning("Dedup check failed for hash=%s: %s", email_hash, exc)
+            is_duplicate = False
+
+        if is_duplicate:
             duplicates += 1
             continue
 
