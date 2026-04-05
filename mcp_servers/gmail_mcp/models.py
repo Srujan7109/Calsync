@@ -55,6 +55,8 @@ class EmailRecord(BaseModel):
     subject: str
     body_text: str
     body_html: Optional[str] = None
+    in_reply_to: Optional[str] = None       # RFC 2822 In-Reply-To header
+    references_header: Optional[str] = None  # RFC 2822 References header chain
     labels: List[str] = []
     processing_status: ProcessingStatus = "PENDING"
     processing_error: Optional[str] = None

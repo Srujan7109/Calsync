@@ -122,6 +122,45 @@ def get_thread_emails(thread_id: str) -> List[dict]:
         raise RuntimeError(f"get_thread_emails failed: {exc}") from exc
 
 
+def get_outbound_emails_for_session(
+    session_id: str,
+    intent_type: Optional[str] = None,
+) -> List[dict]:
+    """
+    Return OUTBOUND emails already sent for this scheduling session.
+
+    Used to deduplicate — if the agent is called twice for the same session
+    (e.g. a webhook fires twice), we skip re-sending the same email.
+
+    Args:
+        session_id: The CalSync session UUID.
+        intent_type: Optional keyword to match in the subject for a finer
+            check ('confirm', 'available', 'clarif'). If None, returns all
+            outbound emails for the session.
+
+    Returns:
+        List[dict]: Matching OUTBOUND email records (empty list = none sent yet).
+
+    Raises:
+        RuntimeError: If the Supabase query fails.
+    """
+    try:
+        query = (
+            supabase.table("emails")
+            .select("id, subject, received_at")
+            .eq("session_id", session_id)
+            .eq("direction", "OUTBOUND")
+        )
+        if intent_type:
+            query = query.ilike("subject", f"%{intent_type}%")
+        response = query.order("received_at", desc=False).execute()
+        return response.data or []
+    except Exception as exc:
+        logger.error("get_outbound_emails_for_session failed: %s", exc)
+        raise RuntimeError(f"get_outbound_emails_for_session failed: {exc}") from exc
+
+
+
 def update_email_status(
     message_id: str,
     status: str,
@@ -311,6 +350,46 @@ def get_session_by_thread(thread_id: str) -> Optional[dict]:
     except Exception as exc:
         logger.error("get_session_by_thread failed: %s", exc)
         raise RuntimeError(f"get_session_by_thread failed: {exc}") from exc
+
+
+def update_thread_summary(session_id: str, summary: str) -> None:
+    """
+    Write an AI-generated thread summary to sessions.thread_summary.
+
+    Also appends a THREAD_SUMMARISED entry to activity_logs so the dashboard
+    can show when the summary was last generated.
+
+    Args:
+        session_id: The CalSync session UUID whose summary should be updated.
+        summary: Plain-English summary produced by the LLM.
+
+    Raises:
+        RuntimeError: If the Supabase update fails.
+    """
+    try:
+        supabase.table("sessions").update(
+            {"thread_summary": summary, "updated_at": _utcnow()}
+        ).eq("session_id", session_id).execute()
+        logger.info("update_thread_summary: session %s summary written.", session_id)
+    except Exception as exc:
+        logger.error("update_thread_summary failed: %s", exc)
+        raise RuntimeError(f"update_thread_summary failed: {exc}") from exc
+
+    # Log the event — non-fatal if it fails
+    try:
+        write_activity_log(
+            LogRequest(
+                session_id=session_id,
+                event_type="THREAD_SUMMARISED",
+                severity="INFO",
+                description="Thread summary generated and stored.",
+                payload={"summary_length": len(summary)},
+                actor="AGENT",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("update_thread_summary: activity log write failed (non-fatal): %s", exc)
+
 
 
 # ── activity_logs table ──────────────────────────────────────────────────────

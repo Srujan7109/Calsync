@@ -69,25 +69,31 @@ TOOLS = [
         ),
         types.FunctionDeclaration(
             name="send_email",
-            description="Send an email via Gmail. You write the full subject and body. Use for availability requests, confirmations, clarifications.",
+            description=(
+                "Send an email via Gmail. You write the full subject and body. "
+                "Use for availability requests, confirmations, clarifications. "
+                "Always set in_reply_to and references when replying to a thread."
+            ),
             parameters=types.Schema(
                 type="OBJECT",
                 properties={
-                    "to_emails":  types.Schema(
+                    "to_emails":    types.Schema(
                         type="ARRAY",
                         items=types.Schema(type="STRING")
                     ),
-                    "subject":    types.Schema(type="STRING"),
-                    "body_text":  types.Schema(type="STRING", description="Full professional email body"),
-                    "thread_id":  types.Schema(type="STRING"),
-                    "session_id": types.Schema(type="STRING")
+                    "subject":      types.Schema(type="STRING"),
+                    "body_text":    types.Schema(type="STRING", description="Full professional email body"),
+                    "thread_id":    types.Schema(type="STRING", description="Gmail thread ID to keep this reply in the same thread"),
+                    "in_reply_to":  types.Schema(type="STRING", description="Message-ID header value of the email being replied to (from fetch_thread last message's message_id_header). Enables proper email threading in all clients."),
+                    "references":   types.Schema(type="STRING", description="Space-separated list of Message-IDs from the thread (from fetch_thread). Set this to the full References chain."),
+                    "session_id":   types.Schema(type="STRING")
                 },
                 required=["to_emails","subject","body_text"]
             )
         ),
         types.FunctionDeclaration(
             name="fetch_thread",
-            description="Fetch full email thread history.",
+            description="Fetch full email thread history. Call this first whenever thread_id is available to read prior messages and extract message_id_header for in_reply_to.",
             parameters=types.Schema(
                 type="OBJECT",
                 properties={
@@ -109,6 +115,32 @@ TOOLS = [
                 },
                 required=["subject","body_text"]
             )
+        ),
+        types.FunctionDeclaration(
+            name="mark_done",
+            description=(
+                "Signal that your task is fully complete. ALWAYS call this as the LAST "
+                "action after all emails are sent and/or meeting is booked. "
+                "Do not call any other tools after mark_done."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "action_type": types.Schema(
+                        type="STRING",
+                        description=(
+                            "What was accomplished. One of: "
+                            "'availability_requested' | 'meeting_booked_and_confirmed' | "
+                            "'clarification_sent' | 'no_action_needed'"
+                        )
+                    ),
+                    "summary": types.Schema(
+                        type="STRING",
+                        description="One-sentence human-readable summary of what was done."
+                    )
+                },
+                required=["action_type"]
+            )
         )
     ])
 ]
@@ -118,20 +150,33 @@ You coordinate meetings by sending emails and booking Google Calendar events.
 You operate via calsync1.ai@gmail.com.
 
 RULES:
-1. Write all email content yourself — professional, friendly, concise
-2. Sign emails as CalSync.ai coordinating on behalf of the organizer
+1. Write all email content yourself — professional, friendly, concise.
+2. Sign emails as CalSync.ai coordinating on behalf of the organizer.
 3. Always append this to every email body:
    ---
    This email was sent by CalSync.ai, an AI scheduling assistant.
    To modify or cancel, reply to this thread.
    ---
-4. Always check_freebusy BEFORE book_meeting
-5. Always send_email confirmation AFTER book_meeting succeeds
-6. Show times in IST (UTC+5:30) in email bodies
-7. For AWAITING_REPLIES: only send availability request emails then stop
-8. For READY_TO_COMPUTE: check_freebusy → book_meeting → send_email confirmation
-9. For NO_OVERLAP: send_email clarification to participants asking for more slots
-10. Make sure you always say - "happy to be always there for you, need any help, cc me please!"""
+4. Always check_freebusy BEFORE book_meeting.
+5. After book_meeting succeeds, send ONE confirmation email to ALL participants
+   (including the organizer) with the time in IST, event link, and Meet link.
+   Google Calendar does NOT send its own invites — you are the only notifier.
+6. Show times in IST (UTC+5:30) in email bodies.
+7. THREAD CONTEXT — whenever situation contains a thread_id:
+   a. Call fetch_thread(thread_id) FIRST to read the conversation history.
+   b. Use the last email's message_id_header value as in_reply_to.
+   c. Build the references field as all message_id_header values in the thread joined by a space.
+   d. This keeps the email thread intact for all email clients.
+8. ORGANIZER EXCLUSION — never include the organizer in to_emails for
+   availability request emails. Only include participants who are not the organizer.
+9. For AWAITING_REPLIES: send availability request emails to non-organizer
+   participants only, then call mark_done(action_type='availability_requested').
+10. For READY_TO_COMPUTE: check_freebusy → book_meeting → send_email confirmation
+    to ALL participants → call mark_done(action_type='meeting_booked_and_confirmed').
+11. For NO_OVERLAP: send clarification email to all participants asking for
+    more slots → call mark_done(action_type='clarification_sent').
+12. ALWAYS call mark_done as the VERY LAST action. Never call any tool after mark_done.
+13. Make sure you always say - \"happy to be always there for you, need any help, cc me please!\""""
 
 # ================================================================
 # TOOL EXECUTION
@@ -176,21 +221,17 @@ def execute_tool(name: str, args: dict, ctx: dict) -> dict:
 
         elif name == "send_email":
             r = httpx.post(f"{GMAIL_MCP}/send", json={
-                "to_emails":  args["to_emails"],
-                "subject":    args["subject"],
-                "body_text":  args["body_text"],
-                "thread_id":  args.get("thread_id"),
-                "session_id": args.get("session_id")
+                "to_emails":   args["to_emails"],
+                "subject":     args["subject"],
+                "body_text":   args["body_text"],
+                "thread_id":   args.get("thread_id"),
+                "in_reply_to": args.get("in_reply_to"),  # RFC 2822 threading header
+                "references":  args.get("references"),   # RFC 2822 references chain
+                "session_id":  args.get("session_id")
             }, timeout=TIMEOUT)
             result = r.json()
             print(f"  📧 Sent to: {args['to_emails']}")
-            subj = args.get("subject","").lower()
-            if "confirm" in subj or "booked" in subj or "scheduled" in subj:
-                ctx["confirmation_sent"] = True
-            elif "available" in subj or "availability" in subj or "schedule" in subj:
-                ctx["availability_sent"] = True
-            elif "clarif" in subj or "no overlap" in subj or "no common" in subj:
-                ctx["clarification_sent"] = True
+            # Note: ctx flags for early-exit are now set exclusively by mark_done.
             return result
 
         elif name == "fetch_thread":
@@ -207,6 +248,16 @@ def execute_tool(name: str, args: dict, ctx: dict) -> dict:
                 "thread_id": args.get("thread_id")
             }, timeout=TIMEOUT)
             return r.json()
+
+        elif name == "mark_done":
+            action_type = args.get("action_type", "no_action_needed")
+            summary     = args.get("summary", "")
+            ctx["done"]        = True
+            ctx["action_type"] = action_type
+            print(f"\n  ✅ mark_done: {action_type}")
+            if summary:
+                print(f"     {summary}")
+            return {"status": "done", "action_type": action_type}
 
         else:
             return {"error": f"Unknown tool: {name}"}
@@ -320,24 +371,20 @@ Send clarification emails to all participants explaining no common slot was foun
             types.Content(role="user", parts=tool_parts)
         )
 
-        # Check completion
-        if ctx.get("confirmation_sent"):
+        # ── Early exit: mark_done was called ─────────────────────────────────
+        if ctx.get("done"):
+            action = ctx.get("action_type", "")
             print("\n" + "="*60)
-            print("✅ Full scheduling flow complete!")
-            print(f"   Event: {ctx.get('event_link')}")
-            print(f"   Meet:  {ctx.get('meet_link')}")
-            print("="*60)
-            break
-
-        if ctx.get("availability_sent") and status == "AWAITING_REPLIES":
-            print("\n" + "="*60)
-            print("✅ Availability requests sent. Waiting for replies.")
-            print("="*60)
-            break
-
-        if ctx.get("clarification_sent") and status == "NO_OVERLAP":
-            print("\n" + "="*60)
-            print("✅ Clarification emails sent.")
+            if action == "meeting_booked_and_confirmed":
+                print("✅ Full scheduling flow complete!")
+                print(f"   Event: {ctx.get('event_link')}")
+                print(f"   Meet:  {ctx.get('meet_link')}")
+            elif action == "availability_requested":
+                print("✅ Availability requests sent. Waiting for replies.")
+            elif action == "clarification_sent":
+                print("✅ Clarification emails sent.")
+            else:
+                print(f"✅ Agent completed: {action}")
             print("="*60)
             break
 

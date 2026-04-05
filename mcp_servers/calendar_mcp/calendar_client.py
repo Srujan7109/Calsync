@@ -104,7 +104,10 @@ def book_meeting(
                 calendarId=settings.CALENDAR_ID,
                 body=event_body,
                 conferenceDataVersion=1,
-                sendUpdates="all",
+                # sendUpdates="none" — CalSync agent sends its own confirmation
+                # email via Gmail MCP after booking, so we suppress the
+                # automatic Google Calendar invite to avoid double-emailing.
+                sendUpdates="none",
             )
             .execute()
         )

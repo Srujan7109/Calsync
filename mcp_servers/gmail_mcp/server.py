@@ -42,6 +42,7 @@ from models import (
     ThreadRequest,
     WatchRequest,
 )
+from supabase_ops import get_outbound_emails_for_session
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL, logging.INFO))
@@ -110,10 +111,38 @@ def _utcnow() -> str:
 # =============================================================================
 
 
+# ── intent-type map (subject keyword → intent label) ─────────────────────────
+_INTENT_KEYWORD_MAP = {
+    "confirm":      "confirm",
+    "booked":       "confirm",
+    "scheduled":    "confirm",
+    "available":    "available",
+    "availability": "available",
+    "clarif":       "clarif",
+    "no overlap":   "clarif",
+    "no common":    "clarif",
+}
+
+
+def _subject_intent(subject: str) -> Optional[str]:
+    """Map an email subject to a canonical intent keyword for dedup checks."""
+    lower = subject.lower()
+    for kw, intent in _INTENT_KEYWORD_MAP.items():
+        if kw in lower:
+            return intent
+    return None
+
+
 @app.post("/send", tags=["Email"])
 async def send_email(req: SendEmailRequest) -> Dict[str, Any]:
     """
     Send a single email via Gmail.
+
+    Before sending, performs a session-level deduplication check: if an
+    OUTBOUND email of the same intent type (availability / confirmation /
+    clarification) has already been dispatched for this session_id, the
+    request is short-circuited and a {status: "already_sent"} response is
+    returned without hitting the Gmail API.
 
     Sends the email, stores it in Supabase (direction=OUTBOUND), and logs
     the activity. The AI disclaimer is appended automatically by gmail_client.
@@ -122,6 +151,33 @@ async def send_email(req: SendEmailRequest) -> Dict[str, Any]:
     Returns: {status, message_id, thread_id, email_id}
     """
     import hashlib
+
+    # ── Deduplication guard ───────────────────────────────────────────────────
+    if req.session_id:
+        intent = _subject_intent(req.subject)
+        if intent:
+            try:
+                existing = get_outbound_emails_for_session(req.session_id, intent)
+                if existing:
+                    logger.info(
+                        "send_email: dedup skip — session %s already has %d "
+                        "OUTBOUND '%s' email(s). Subject: '%s'",
+                        req.session_id,
+                        len(existing),
+                        intent,
+                        req.subject,
+                    )
+                    return {
+                        "status": "already_sent",
+                        "session_id": req.session_id,
+                        "existing_count": len(existing),
+                        "skipped": True,
+                    }
+            except RuntimeError as exc:
+                # Dedup check failed — log and fall through to send anyway
+                logger.warning(
+                    "send_email: dedup check failed (non-fatal), sending anyway: %s", exc
+                )
 
     try:
         result = gmail_client.send_email(req)
