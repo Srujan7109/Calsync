@@ -271,6 +271,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
 
     trace = ""
     action_taken = "NO_ACTION"
+    notified_recipients = list(inbound_people)
 
     # ══════════════════════════════════════════════════════════════════════════
     # NEW SESSION — organizer CC'd CalSync requesting a meeting
@@ -329,30 +330,56 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
 
             trace = f"Received availability from {payload.from_email} ({len(slots)} slots)."
 
-        # Check if everyone has now replied
-        if not pending:
-            collected = await thread_service.get_collected_slots(session_id)
+        # Rebuild replied/pending from persisted collected_slots so simultaneous replies don't get lost
+        collected_now = await thread_service.get_collected_slots(session_id)
+        collected_responders = {str(p).lower() for p in (collected_now or {}).keys()}
+        replied = [p for p in all_p if p.lower() in collected_responders]
+        replied_set = {e.lower() for e in replied}
+        pending = [p for p in all_p if p.lower() not in replied_set]
+        replied_count = len(replied)
+        total_count = len(all_p)
+        all_replied = replied_count == total_count
+        logger.info(
+            "Reply progress session=%s replied=%d total=%d all_replied=%s pending=%s",
+            session_id,
+            replied_count,
+            total_count,
+            all_replied,
+            pending,
+        )
+
+        # Compute only when every participant (including organizer) has replied.
+        if all_replied:
+            collected = collected_now
             logger.info("All %d participants replied. Collected: %s", len(all_p), collected)
 
-            # Filter out participants with no slots
-            valid = {p: s for p, s in collected.items() if s}
+            # Require slots from every participant (including organizer) before overlap.
+            # Use case-insensitive matching because incoming emails may differ in casing.
+            by_lower = {
+                str(email).lower(): slots
+                for email, slots in (collected or {}).items()
+                if isinstance(slots, list)
+            }
+            slots_by_participant = {p: by_lower.get(p.lower(), []) for p in all_p}
+            missing_slots = [p for p, slots in slots_by_participant.items() if not slots]
 
-            if len(valid) < 2:
-                # Not enough slot data — ask organizer
+            if missing_slots:
+                # Some participants replied but we could not extract clear slots yet.
                 await tools.send_gmail_message(
                     recipients=[session.organizer_email],
                     subject=f"Need more availability details — {meeting_title}",
                     body_text=(
                         f"All participants have responded for '{meeting_title}', but I couldn't extract "
-                        f"specific time slots from some replies. Could you clarify the available times?\n\n"
+                        f"specific time slots for: {', '.join(missing_slots)}.\n\n"
+                        "Could you ask them to reply with explicit dates/times in IST?\n\n"
                         f"[calsync-ref:{session_id}]"
                     ),
                     thread_id="", session_id=session_id,
                 )
-                trace += " Insufficient slot data, asked organizer to clarify."
+                trace += f" Missing/unclear slots for {missing_slots}. Asked organizer to clarify."
             else:
                 # Compute overlap
-                overlapping = _compute_overlap(valid, duration_minutes=60)
+                overlapping = _compute_overlap(slots_by_participant, duration_minutes=60)
                 logger.info("Overlap result: %s", overlapping)
 
                 if overlapping:
@@ -377,6 +404,10 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                             bslot = booked.get("booked_slot", best)
                             meet_link = booked.get("meet_link", "")
                             event_link = booked.get("event_link", "")
+                            calendar_invites = booked.get("invites_sent_to", [])
+                            invite_set = {str(e).lower() for e in calendar_invites}
+                            expected_set = {str(e).lower() for e in all_p}
+                            missing_calendar_invites = [p for p in all_p if p.lower() not in invite_set]
                             start_str = _fmt_ist(str(bslot.get("start", "")))
                             end_str = _fmt_ist(str(bslot.get("end", "")))
 
@@ -387,14 +418,52 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                                 f"📆 Calendar: {event_link or 'See calendar invite'}\n\n"
                                 "You'll receive a Google Calendar invite shortly.\n\nCalSync.ai"
                             )
+                            confirm_ok: list[str] = []
+                            confirm_failed: list[str] = []
                             for p in all_p:
-                                await tools.send_gmail_message(
+                                send_result = await tools.send_gmail_message(
                                     recipients=[p],
                                     subject=f"Meeting Confirmed: {meeting_title}",
                                     body_text=confirm,
                                     thread_id="", session_id=session_id,
                                 )
-                            trace += f" Booked at {start_str}. Confirmations sent to all."
+                                if send_result.status == "OK":
+                                    confirm_ok.append(p)
+                                else:
+                                    confirm_failed.append(p)
+
+                            notified_recipients = list(confirm_ok)
+                            logger.info(
+                                "Post-book delivery session=%s calendar_invites=%s confirmations_ok=%s confirmations_failed=%s",
+                                session_id,
+                                calendar_invites,
+                                confirm_ok,
+                                confirm_failed,
+                            )
+                            if missing_calendar_invites:
+                                logger.warning(
+                                    "Calendar invite verification session=%s expected=%s got=%s missing=%s",
+                                    session_id,
+                                    sorted(expected_set),
+                                    sorted(invite_set),
+                                    missing_calendar_invites,
+                                )
+
+                            if confirm_failed:
+                                trace += (
+                                    f" Booked at {start_str}. Calendar invites: {calendar_invites}. "
+                                    f"Confirmation emails OK for {confirm_ok}, failed for {confirm_failed}."
+                                )
+                            elif missing_calendar_invites:
+                                trace += (
+                                    f" Booked at {start_str}. Calendar invites missing for {missing_calendar_invites}. "
+                                    "Confirmation emails sent to all participants."
+                                )
+                            else:
+                                trace += (
+                                    f" Booked at {start_str}. Calendar invites: {calendar_invites}. "
+                                    f"Confirmation emails sent to all participants."
+                                )
                         else:
                             trace += " Booking API failed."
                     else:
@@ -470,7 +539,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
     return AgentProcessResponse(agent_result=AgentResult(
         action_taken=action_taken,
         session_id=session_id,
-        emails_sent_to=inbound_people,
+        emails_sent_to=notified_recipients,
         reasoning_trace=trace,
     ))
 

@@ -117,6 +117,19 @@ class ThreadStateService:
     async def persist_state(self, state: ThreadSessionState) -> None:
         if not self._enabled():
             return
+        current = await self._get_session_by_id(state.session_id)
+        if current:
+            persisted_participants = current.get("participants") or []
+            persisted_replied = current.get("replied_participants") or []
+            state.participants = list(dict.fromkeys([
+                *(persisted_participants if isinstance(persisted_participants, list) else []),
+                *state.participants,
+            ]))
+            state.replied_participants = list(dict.fromkeys([
+                *(persisted_replied if isinstance(persisted_replied, list) else []),
+                *state.replied_participants,
+            ]))
+
         await self._upsert_session_row(
             session_id=state.session_id,
             thread_id=state.thread_id,
@@ -133,6 +146,19 @@ class ThreadStateService:
         params = {
             "select": "session_id,thread_id,status,organizer_email,meeting_title,participants,replied_participants,last_reminder_at",
             "thread_id": f"eq.{thread_id}",
+            "limit": "1",
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(table_url, headers=self._headers(), params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data[0] if data else None
+
+    async def _get_session_by_id(self, session_id: str) -> dict[str, object] | None:
+        table_url = f"{self.base_url}/rest/v1/sessions"
+        params = {
+            "select": "session_id,thread_id,status,organizer_email,meeting_title,participants,replied_participants,last_reminder_at",
+            "session_id": f"eq.{session_id}",
             "limit": "1",
         }
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -202,23 +228,37 @@ class ThreadStateService:
         if not self._enabled():
             return
         try:
-            # Read current collected_slots
             table_url = f"{self.base_url}/rest/v1/sessions"
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.get(
-                    table_url,
-                    headers=self._headers(),
-                    params={"select": "collected_slots", "session_id": f"eq.{session_id}", "limit": "1"},
-                )
-                rows = r.json() if r.status_code == 200 else []
-                current = (rows[0].get("collected_slots") or {}) if rows else {}
-                current[participant_email] = slots
-                await client.patch(
-                    table_url,
-                    headers=self._headers(prefer="return=minimal"),
-                    params={"session_id": f"eq.{session_id}"},
-                    json={"collected_slots": current, "updated_at": _utcnow_iso()},
-                )
+            for _ in range(3):
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    r = await client.get(
+                        table_url,
+                        headers=self._headers(),
+                        params={"select": "collected_slots", "session_id": f"eq.{session_id}", "limit": "1"},
+                    )
+                    rows = r.json() if r.status_code == 200 else []
+                    current = (rows[0].get("collected_slots") or {}) if rows else {}
+                    merged = dict(current) if isinstance(current, dict) else {}
+                    merged[participant_email] = slots
+
+                    await client.patch(
+                        table_url,
+                        headers=self._headers(prefer="return=minimal"),
+                        params={"session_id": f"eq.{session_id}"},
+                        json={"collected_slots": merged, "updated_at": _utcnow_iso()},
+                    )
+
+                    verify = await client.get(
+                        table_url,
+                        headers=self._headers(),
+                        params={"select": "collected_slots", "session_id": f"eq.{session_id}", "limit": "1"},
+                    )
+                    verify_rows = verify.json() if verify.status_code == 200 else []
+                    after = (verify_rows[0].get("collected_slots") or {}) if verify_rows else {}
+                    if isinstance(after, dict) and participant_email in after:
+                        return
+
+            logger.warning("update_participant_slots retried 3 times for %s without stable merge", participant_email)
         except Exception as exc:
             logger.warning("update_participant_slots failed: %s", exc)
 
