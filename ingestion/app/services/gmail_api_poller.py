@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -111,6 +112,7 @@ async def run_gmail_api_poller() -> None:
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         while True:
+            loop_start = time.monotonic()
             try:
                 await fetch_and_queue_gmail_messages(
                     client,
@@ -120,7 +122,16 @@ async def run_gmail_api_poller() -> None:
             except Exception as exc:
                 logger.exception("Gmail API poller iteration failed: %s", exc)
 
-            await asyncio.sleep(max(settings.imap_poll_interval_seconds, 1))
+            elapsed = time.monotonic() - loop_start
+            target_interval = max(settings.imap_poll_interval_seconds, 1)
+            sleep_for = max(target_interval - elapsed, 0.0)
+            logger.debug(
+                "Gmail API poll loop elapsed=%.3fs target_interval=%ss sleep=%.3fs",
+                elapsed,
+                target_interval,
+                sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
 
 
 async def _mark_read(client: httpx.AsyncClient, gmail_mcp_url: str, gmail_message_id: str) -> None:
