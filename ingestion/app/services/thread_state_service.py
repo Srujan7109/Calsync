@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import httpx
+import logging as logger
 
 from ingestion.app.config import get_settings
 
@@ -195,3 +196,46 @@ class ThreadStateService:
                 json=insert_payload,
             )
             insert_response.raise_for_status()
+    
+    async def update_participant_slots(self, session_id: str, participant_email: str, slots: list) -> None:
+        """Append parsed slots to collected_slots JSONB for a participant."""
+        if not self._enabled():
+            return
+        try:
+            # Read current collected_slots
+            table_url = f"{self.base_url}/rest/v1/sessions"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    table_url,
+                    headers=self._headers(),
+                    params={"select": "collected_slots", "session_id": f"eq.{session_id}", "limit": "1"},
+                )
+                rows = r.json() if r.status_code == 200 else []
+                current = (rows[0].get("collected_slots") or {}) if rows else {}
+                current[participant_email] = slots
+                await client.patch(
+                    table_url,
+                    headers=self._headers(prefer="return=minimal"),
+                    params={"session_id": f"eq.{session_id}"},
+                    json={"collected_slots": current, "updated_at": _utcnow_iso()},
+                )
+        except Exception as exc:
+            logger.warning("update_participant_slots failed: %s", exc)
+
+    async def get_collected_slots(self, session_id: str) -> dict:
+        """Return collected_slots JSONB for a session."""
+        if not self._enabled():
+            return {}
+        try:
+            table_url = f"{self.base_url}/rest/v1/sessions"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    table_url,
+                    headers=self._headers(),
+                    params={"select": "collected_slots", "session_id": f"eq.{session_id}", "limit": "1"},
+                )
+                rows = r.json() if r.status_code == 200 else []
+                return (rows[0].get("collected_slots") or {}) if rows else {}
+        except Exception as exc:
+            logger.warning("get_collected_slots failed: %s", exc)
+            return {}

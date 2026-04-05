@@ -47,7 +47,7 @@ class Settings(BaseSettings):
 
     # ── CalSync Calendar ──────────────────────────────────────────────────────
     CALSYNC_EMAIL: str = Field(
-        default="ameya.dusane05@gmail.com",
+        default="calsync1.ai@gmail.com",
         description="The central CalSync.ai Gmail address",
     )
     CALENDAR_ID: str = Field(

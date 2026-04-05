@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import httpx
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
 from typing import Any
 
-from ingestion.app.agent.prompts import AGENT_ANALYSIS_PROMPT
 from ingestion.app.agent.tools import CalsyncTools
 from ingestion.app.config import get_settings
 from ingestion.app.models.agent_models import AgentProcessResponse, AgentResult
@@ -16,457 +17,475 @@ from ingestion.app.models.email_models import AgentProcessPayload
 from ingestion.app.services.participant_utils import dedupe_emails, exclude_emails, parse_email_addresses
 from ingestion.app.services.thread_state_service import ThreadSessionState, ThreadStateService
 
-
 logger = logging.getLogger("uvicorn.error")
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
-def _looks_like_new_meeting(subject: str, body_text: str) -> bool:
-    text = f"{subject} {body_text}".lower()
-    return any(word in text for word in ["meeting", "schedule", "available", "sync", "call"])
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _extract_json_payload(raw_text: str) -> dict[str, Any] | None:
-    left = raw_text.find("{")
-    right = raw_text.rfind("}")
-    if left < 0 or right < left:
-        return None
+def _fmt_ist(utc_iso: str) -> str:
     try:
-        return json.loads(raw_text[left : right + 1])
-    except json.JSONDecodeError:
-        return None
+        return datetime.fromisoformat(utc_iso.replace("Z", "+00:00")).astimezone(IST).strftime("%d %b %Y %I:%M %p IST")
+    except Exception:
+        return utc_iso
 
 
-def _normalize_recipients(payload: AgentProcessPayload) -> list[str]:
-    recipients = [p.strip() for p in payload.participants if p and p.strip()]
-    if not recipients and payload.from_email:
-        recipients = [payload.from_email]
-
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for recipient in recipients:
-        key = recipient.lower()
-        if key not in seen:
-            seen.add(key)
-            deduped.append(recipient)
-    return deduped
+def _extract_ref(text: str) -> str | None:
+    m = re.search(r'\[calsync-ref:([a-z0-9_]+)\]', text or "", re.IGNORECASE)
+    return m.group(1) if m else None
 
 
-def _collect_participants_from_thread_payload(thread_payload: dict[str, object], excluded: list[str]) -> tuple[list[str], list[str]]:
-    emails = thread_payload.get("emails")
-    if not isinstance(emails, list):
-        return [], []
-
-    participants: list[str] = []
-    replied: list[str] = []
-    for item in emails:
-        if not isinstance(item, dict):
-            continue
-
-        from_email = str(item.get("from_email") or "")
-        to_emails = item.get("to_emails") if isinstance(item.get("to_emails"), list) else []
-        cc_emails = item.get("cc_emails") if isinstance(item.get("cc_emails"), list) else []
-
-        participants.extend(parse_email_addresses(from_email))
-        participants.extend(parse_email_addresses(",".join(str(v) for v in to_emails)))
-        participants.extend(parse_email_addresses(",".join(str(v) for v in cc_emails)))
-
-        sender = parse_email_addresses(from_email)
-        if sender:
-            replied.extend(sender)
-
-    participants = exclude_emails(dedupe_emails(participants), excluded)
-    replied = exclude_emails(dedupe_emails(replied), excluded)
-    return participants, replied
-
-
-def _parse_iso_timestamp(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        normalized = value.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(normalized)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-
-
-def _should_send_reminder(last_reminder_at: str | None, cooldown_minutes: int) -> bool:
-    last = _parse_iso_timestamp(last_reminder_at)
+def _cooldown_ok(last: str | None, minutes: int) -> bool:
     if not last:
         return True
-    return datetime.now(timezone.utc) - last >= timedelta(minutes=max(cooldown_minutes, 1))
-
-
-async def _analyze_email_with_gemini(payload: AgentProcessPayload) -> dict[str, Any]:
-    settings = get_settings()
-    default_action = "SENT_AVAILABILITY_REQUEST" if _looks_like_new_meeting(payload.subject, payload.body_text) else "NO_ACTION"
-    default_reasoning = "Thought: deterministic scheduling intent check. Action: fallback pipeline."
-
-    if not settings.gemini_api_key:
-        logger.info(
-            "Agent decision source=fallback reason=missing_gemini_api_key subject=%s from=%s action=%s",
-            payload.subject,
-            payload.from_email,
-            default_action,
-        )
-        return {
-            "action": default_action,
-            "title": payload.subject.strip() or "Meeting coordination",
-            "reasoning_trace": default_reasoning,
-            "request_email_body": "Could you please share your preferred time slots and timezone?",
-            "slot": None,
-        }
-
     try:
-        gemini_module = import_module("google.genai")
-    except ModuleNotFoundError:
-        logger.info(
-            "Agent decision source=fallback reason=missing_google_genai subject=%s from=%s action=%s",
-            payload.subject,
-            payload.from_email,
-            default_action,
-        )
-        return {
-            "action": default_action,
-            "title": payload.subject.strip() or "Meeting coordination",
-            "reasoning_trace": default_reasoning,
-            "request_email_body": "Could you please share your preferred time slots and timezone?",
-            "slot": None,
-        }
+        ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - ts >= timedelta(minutes=max(minutes, 1))
+    except Exception:
+        return True
 
-    prompt = AGENT_ANALYSIS_PROMPT.format(
-        subject=payload.subject,
-        from_email=payload.from_email,
-        participants=", ".join(payload.participants),
-        current_time=datetime.now(timezone.utc).isoformat(),
-        body=payload.body_text[:2000],
-    )
-    client = gemini_module.Client(api_key=settings.gemini_api_key)
 
-    # Retry with exponential backoff on 429 rate-limit errors
-    max_retries = 4
-    response = None
-    for attempt in range(max_retries):
+def _compute_overlap(slots_by_participant: dict, duration_minutes: int = 60) -> list[dict]:
+    """Pure Python overlap computation — no external service needed."""
+    if not slots_by_participant:
+        return []
+
+    participants = list(slots_by_participant.keys())
+    duration = timedelta(minutes=duration_minutes)
+
+    def parse_dt(s: str) -> datetime:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    # Start with first participant's slots
+    overlaps = []
+    for slot in slots_by_participant[participants[0]]:
         try:
-            response = await asyncio.to_thread(
+            overlaps.append({"start": parse_dt(slot["start"]), "end": parse_dt(slot["end"])})
+        except Exception:
+            pass
+
+    # Intersect with each subsequent participant
+    for p in participants[1:]:
+        new_overlaps = []
+        for candidate in overlaps:
+            for p_slot in slots_by_participant.get(p, []):
+                try:
+                    p_start = parse_dt(p_slot["start"])
+                    p_end = parse_dt(p_slot["end"])
+                    overlap_start = max(candidate["start"], p_start)
+                    overlap_end = min(candidate["end"], p_end)
+                    if overlap_end - overlap_start >= duration:
+                        new_overlaps.append({"start": overlap_start, "end": overlap_end})
+                except Exception:
+                    pass
+        overlaps = new_overlaps
+
+    # Return as ISO strings, trimmed to exact duration
+    result = []
+    for ov in overlaps[:3]:  # top 3
+        end = ov["start"] + duration
+        result.append({
+            "start": ov["start"].isoformat(),
+            "end": end.isoformat(),
+        })
+    return result
+
+
+async def _gemini(prompt: str, settings) -> str:
+    """Raw Gemini call, returns text."""
+    try:
+        genai = import_module("google.genai")
+    except ModuleNotFoundError:
+        return ""
+    client = genai.Client(api_key=settings.gemini_api_key)
+    for attempt in range(3):
+        try:
+            resp = await asyncio.to_thread(
                 client.models.generate_content,
                 model=settings.gemini_model,
                 contents=prompt,
             )
-            break  # success — exit retry loop
+            return getattr(resp, "text", "") or ""
         except Exception as exc:
-            error_str = str(exc)
-            is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
-            if is_rate_limit and attempt < max_retries - 1:
-                wait_seconds = 2 ** (attempt + 1) * 15  # 30s, 60s, 120s
-                logger.warning(
-                    "Gemini rate limited (attempt %d/%d) — retrying in %ds",
-                    attempt + 1, max_retries, wait_seconds,
-                )
-                await asyncio.sleep(wait_seconds)
+            if ("429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)) and attempt < 2:
+                await asyncio.sleep(30 * (attempt + 1))
                 continue
-            logger.warning("Gemini call failed after %d attempts: %s", attempt + 1, exc)
-            return {
-                "action": default_action,
-                "title": payload.subject.strip() or "Meeting coordination",
-                "reasoning_trace": f"Thought: Gemini unavailable ({exc}). Action: deterministic fallback.",
-                "request_email_body": "Could you please share your preferred time slot?",
-                "slot": None,
-            }
+            logger.warning("Gemini call failed: %s", exc)
+            return ""
+    return ""
 
-    output_text = getattr(response, "text", "") or "" if response else ""
-    parsed = _extract_json_payload(output_text)
-    if parsed is None:
-        logger.info(
-            "Agent decision source=fallback reason=invalid_gemini_json subject=%s from=%s action=%s",
-            payload.subject,
-            payload.from_email,
-            default_action,
+
+async def _extract_slots_with_gemini(body_text: str, settings) -> list[dict]:
+    """Ask Gemini to extract time slots from availability reply text."""
+    if not settings.gemini_api_key:
+        return []
+
+    prompt = f"""Extract ALL time slots from this availability email. 
+Return ONLY a JSON array of objects with "start" and "end" keys in ISO 8601 UTC format.
+Assume all times are IST (UTC+5:30) unless stated otherwise.
+If no clear time slots, return [].
+
+Email:
+{body_text[:1000]}
+
+Return only the JSON array, nothing else. Example: [{{"start":"2026-04-06T09:30:00Z","end":"2026-04-06T10:30:00Z"}}]"""
+
+    raw = await _gemini(prompt, settings)
+    raw = raw.strip()
+    l, r = raw.find("["), raw.rfind("]")
+    if l < 0 or r < l:
+        return []
+    try:
+        slots = json.loads(raw[l:r + 1])
+        return [s for s in slots if s.get("start") and s.get("end")]
+    except Exception:
+        return []
+
+
+async def _classify_email(body_text: str, subject: str, settings) -> str:
+    """Classify email as NEW_REQUEST, AVAILABILITY_REPLY, or OTHER."""
+    text = f"{subject} {body_text}".lower()
+
+    # Quick keyword checks
+    availability_words = ["available", "free", "i can", "works for me", "how about", "3pm", "4pm", "am", "pm", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday"]
+    request_words = ["schedule", "meeting", "arrange", "set up", "sync", "please coordinate", "calsync"]
+
+    has_availability = sum(1 for w in availability_words if w in text)
+    has_request = any(w in text for w in request_words)
+
+    if has_availability >= 2:
+        return "AVAILABILITY_REPLY"
+    if has_request:
+        return "NEW_REQUEST"
+    return "OTHER"
+
+
+async def _lookup_session(thread_service: ThreadStateService, session_id: str) -> ThreadSessionState | None:
+    if not thread_service._enabled():
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.get(
+                f"{thread_service.base_url}/rest/v1/sessions",
+                headers=thread_service._headers(),
+                params={"select": "*", "session_id": f"eq.{session_id}", "limit": "1"},
+            )
+            rows = r.json() if r.status_code == 200 else []
+        if not rows:
+            return None
+        row = rows[0]
+        return ThreadSessionState(
+            session_id=row["session_id"],
+            thread_id=row["thread_id"],
+            status=row.get("status", "AWAITING_REPLIES"),
+            organizer_email=row.get("organizer_email", ""),
+            meeting_title=row.get("meeting_title", "Meeting"),
+            participants=list(row.get("participants") or []),
+            replied_participants=list(row.get("replied_participants") or []),
+            last_reminder_at=row.get("last_reminder_at"),
         )
-        return {
-            "action": default_action,
-            "title": payload.subject.strip() or "Meeting coordination",
-            "reasoning_trace": "Thought: invalid Gemini JSON response. Action: deterministic fallback.",
-            "request_email_body": "Could you please share your preferred time slots and timezone?",
-            "slot": None,
-        }
-    logger.info(
-        "Agent decision source=gemini subject=%s from=%s action=%s",
-        payload.subject,
-        payload.from_email,
-        str(parsed.get("action") or "NO_ACTION"),
-    )
-    return parsed
+    except Exception as exc:
+        logger.warning("_lookup_session failed: %s", exc)
+        return None
 
+
+# ── Main agent ────────────────────────────────────────────────────────────────
 
 async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
     tools = CalsyncTools()
     settings = get_settings()
     thread_service = ThreadStateService()
+    calsync = (settings.gmail_sender_email or "calsync1.ai@gmail.com").lower()
 
     thread_id = payload.thread_id.strip() or payload.message_id
-    excluded = dedupe_emails([settings.gmail_sender_email or "", payload.from_email])
-    recipients = _normalize_recipients(payload)
+    sender = payload.from_email.lower()
 
-    session = ThreadSessionState(
-        session_id=f"sess_{uuid.uuid4().hex[:8]}",
-        thread_id=thread_id,
-        status="AWAITING_REPLIES",
-        organizer_email=payload.from_email,
-        meeting_title=payload.subject or "Meeting",
-        participants=[],
-        replied_participants=[],
-        last_reminder_at=None,
+    # Skip emails from CalSync itself to avoid loops
+    if sender == calsync:
+        return AgentProcessResponse(agent_result=AgentResult(
+            action_taken="NO_ACTION", session_id="", emails_sent_to=[],
+            reasoning_trace="Skipped own outbound email.",
+        ))
+
+    inbound_people = exclude_emails(
+        dedupe_emails(payload.participants + [payload.from_email]), [calsync]
     )
-    if settings.thread_intelligence_enabled:
-        try:
-            session = await thread_service.get_or_create_session(
-                thread_id=thread_id,
-                organizer_email=payload.from_email,
-                meeting_title=payload.subject or "Meeting",
-                participants=recipients,
-            )
-        except Exception as exc:  # pragma: no cover - external dependency safety
-            logger.warning("Thread session restore skipped: %s", exc)
 
-    analysis = await _analyze_email_with_gemini(payload)
-    action = str(analysis.get("action") or "NO_ACTION")
-    reasoning_trace = str(analysis.get("reasoning_trace") or "Thought: no-op.")
-    meeting_title = str(analysis.get("title") or payload.subject or "Meeting coordination")
-    session_id = session.session_id or f"sess_{uuid.uuid4().hex[:8]}"
+    # ── Restore or create session ─────────────────────────────────────────────
+    session: ThreadSessionState | None = None
+    try:
+        session = await thread_service.get_or_create_session(
+            thread_id=thread_id,
+            organizer_email=payload.from_email,
+            meeting_title=payload.subject or "Meeting",
+            participants=inbound_people,
+        )
+    except Exception as exc:
+        logger.warning("Session restore by thread_id failed: %s", exc)
 
-    session.meeting_title = meeting_title
-    session.organizer_email = payload.from_email
+    # Try body ref for replies to our individual emails
+    ref = _extract_ref(payload.body_text)
+    is_new = session is None or (not session.replied_participants and session.last_reminder_at is None)
 
-    # Build participant pool: always restore full list from persisted session state
-    participant_pool = dedupe_emails(session.participants + recipients + [payload.from_email])
-    participant_pool = exclude_emails(participant_pool, [settings.gmail_sender_email or ""])
+    if ref and is_new:
+        recovered = await _lookup_session(thread_service, ref)
+        if recovered:
+            session = recovered
+            is_new = False
+            logger.info("Session recovered via body ref=%s", recovered.session_id)
 
-    # Mark the sender of the current email as having replied
-    replied_pool = dedupe_emails(session.replied_participants + [payload.from_email])
-    replied_pool = exclude_emails(replied_pool, [settings.gmail_sender_email or ""])
+    if session is None:
+        session = ThreadSessionState(
+            session_id=f"sess_{uuid.uuid4().hex[:8]}",
+            thread_id=thread_id,
+            status="AWAITING_REPLIES",
+            organizer_email=payload.from_email,
+            meeting_title=payload.subject or "Meeting",
+            participants=inbound_people,
+            replied_participants=[],
+            last_reminder_at=None,
+        )
+        is_new = True
 
-    if settings.thread_intelligence_enabled and thread_id and thread_id != payload.message_id:
-        thread_outcome = await tools.fetch_thread(thread_id=thread_id)
-        reasoning_trace = f"{reasoning_trace} Tool: fetch_thread={thread_outcome.status}."
-        if thread_outcome.status == "OK":
-            thread_participants, thread_replied = _collect_participants_from_thread_payload(thread_outcome.payload, excluded)
-            previous_count = len(set(email.lower() for email in participant_pool))
-            participant_pool = dedupe_emails(participant_pool + thread_participants)
-            replied_pool = dedupe_emails(replied_pool + thread_replied)
-            if len(set(email.lower() for email in participant_pool)) > previous_count:
-                reasoning_trace = f"{reasoning_trace} Observation: late_joiner_detected."
-
-    pending_participants = [
-        participant
-        for participant in participant_pool
-        if participant.lower() not in {email.lower() for email in replied_pool}
-    ]
-
-    is_new_session = not session.replied_participants and session.last_reminder_at is None
-
-    reminders_sent = False
+    session_id = session.session_id
+    is_new = not session.replied_participants and session.last_reminder_at is None
+    all_p = exclude_emails(dedupe_emails(session.participants + inbound_people), [calsync])
+    replied = exclude_emails(dedupe_emails(session.replied_participants + [payload.from_email]), [calsync])
+    replied_set = {e.lower() for e in replied}
+    organizer = (session.organizer_email or payload.from_email).lower()
+    pending = [p for p in all_p if p.lower() not in replied_set]
+    meeting_title = session.meeting_title or payload.subject or "Meeting"
 
     logger.info(
-        "Agent execution session_id=%s action=%s subject=%s is_new=%s pending=%s",
-        session_id,
-        action,
-        payload.subject,
-        is_new_session,
-        len(pending_participants),
+        "Agent session=%s is_new=%s all=%s replied=%s pending=%s",
+        session_id, is_new, all_p, replied, pending
     )
 
-    if action == "SENT_AVAILABILITY_REQUEST":
-        request_body = str(
-            analysis.get("request_email_body")
-            or "Thanks for reaching out. Please share your preferred time slot so I can coordinate the meeting."
+    trace = ""
+    action_taken = "NO_ACTION"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # NEW SESSION — organizer CC'd CalSync requesting a meeting
+    # ══════════════════════════════════════════════════════════════════════════
+    if is_new and session.status != "BOOKED":
+        # Extract meeting title from Gemini if possible
+        if settings.gemini_api_key:
+            title_prompt = f"Extract a short 3-5 word meeting title from this email subject/body. Return ONLY the title text.\nSubject: {payload.subject}\nBody: {payload.body_text[:500]}"
+            title = await _gemini(title_prompt, settings)
+            if title.strip():
+                meeting_title = title.strip().strip('"').strip("'")
+                session.meeting_title = meeting_title
+
+        availability_body = (
+            f"Hi,\n\n"
+            f"I'm CalSync.ai, helping {session.organizer_email} schedule '{meeting_title}'.\n\n"
+            f"Please reply to this email with your available dates and times (IST). "
+            f"For example: 'I'm free tomorrow 3pm-5pm IST and Monday 10am-12pm IST'.\n\n"
+            f"Thank you!\n\nCalSync.ai\n\n[calsync-ref:{session_id}]"
         )
 
-        send_to = participant_pool if is_new_session else (pending_participants or participant_pool)
-        send_thread_id = thread_id if is_new_session else None
-
-        if send_to:
-            gmail_outcome = await tools.send_gmail_message(
-                recipients=send_to,
-                subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
-                body_text=request_body,
-                thread_id=send_thread_id,
+        for p in all_p:
+            result = await tools.send_gmail_message(
+                recipients=[p],
+                subject=f"When are you free? — {meeting_title}",
+                body_text=availability_body,
+                thread_id="",
                 session_id=session_id,
             )
-            reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
+            logger.info("Availability request sent to %s status=%s", p, result.status)
 
-            if gmail_outcome.status == "OK" and is_new_session:
-                session.last_reminder_at = datetime.now(timezone.utc).isoformat()
+        session.last_reminder_at = _now_iso()
+        session.status = "AWAITING_REPLIES"
+        action_taken = "SENT_AVAILABILITY_REQUEST"
+        trace = f"New session. Sent availability requests to {all_p}."
 
-        if (
-            settings.thread_intelligence_enabled
-            and not is_new_session
-            and session.status == "AWAITING_REPLIES"
-            and pending_participants
-            and _should_send_reminder(session.last_reminder_at, settings.reminder_cooldown_minutes)
-        ):
-            reminder_body = (
-                f"Quick reminder: we are still waiting on your availability to finalise '{meeting_title}'.\n\n"
-                "Please reply with specific dates and times (IST) that work for you."
-            )
-            reminder_outcome = await tools.send_gmail_message(
-                recipients=pending_participants,
-                subject=f"Reminder: availability needed for {meeting_title}",
-                body_text=reminder_body,
-                thread_id=None,
-                session_id=session_id,
-            )
-            reminders_sent = reminder_outcome.status == "OK"
-            reasoning_trace = f"{reasoning_trace} Tool: reminder_email={reminder_outcome.status}."
+    # ══════════════════════════════════════════════════════════════════════════
+    # EXISTING SESSION — participant sent their availability
+    # ══════════════════════════════════════════════════════════════════════════
+    elif not is_new and session.status not in ("BOOKED", "CANCELLED"):
 
-    elif action == "BOOKED_CALENDAR":
-        # Guard: don't book if session is already BOOKED
-        if settings.thread_intelligence_enabled and session.status == "BOOKED":
-            logger.info(
-                "Session %s already BOOKED — skipping duplicate booking for thread %s",
-                session_id, thread_id
-            )
-            return AgentProcessResponse(
-                agent_result=AgentResult(
-                    action_taken="NO_ACTION",
-                    session_id=session_id,
-                    emails_sent_to=[],
-                    reasoning_trace="Session already BOOKED. Duplicate agent run suppressed.",
-                )
-            )
+        email_type = await _classify_email(payload.body_text, payload.subject, settings)
+        action_taken = "AVAILABILITY_REPLY"
 
-        # FIX 2: Gate booking — all participants must have replied before we book
-        if pending_participants:
-            logger.info(
-                "Session %s waiting for replies from: %s — overriding BOOKED_CALENDAR to SENT_AVAILABILITY_REQUEST",
-                session_id, pending_participants
-            )
-            action = "SENT_AVAILABILITY_REQUEST"
-            wait_body = (
-                f"We're still waiting to hear from {len(pending_participants)} participant(s). "
-                "Please reply with a time slot that works for you."
-            )
-            gmail_outcome = await tools.send_gmail_message(
-                recipients=pending_participants,
-                subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
-                body_text=wait_body,
-                thread_id=None,
-                session_id=session_id,
-            )
-            reasoning_trace = f"{reasoning_trace} Tool: waiting_for_participants={gmail_outcome.status}."
-        else:
-            slot = analysis.get("slot") if isinstance(analysis.get("slot"), dict) else {}
-            calendar_slot = {"start": str(slot.get("start_iso") or ""), "end": str(slot.get("end_iso") or "")}
+        if email_type == "AVAILABILITY_REPLY":
+            # Extract slots from this reply
+            slots = await _extract_slots_with_gemini(payload.body_text, settings)
+            logger.info("Extracted %d slots from %s: %s", len(slots), payload.from_email, slots)
 
-            if not calendar_slot["start"] or not calendar_slot["end"]:
-                action = "SENT_AVAILABILITY_REQUEST"
-                request_body = "Please let me know a time slot so I can book the meeting."
-                gmail_outcome = await tools.send_gmail_message(
-                    recipients=participant_pool,
-                    subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
-                    body_text=request_body,
-                    thread_id=None,
-                    session_id=session_id,
-                )
-                reasoning_trace = (
-                    f"{reasoning_trace} Tool: missing_slot_data. Tool: send_gmail_message={gmail_outcome.status}."
-                )
+            # Persist slots to collected_slots in DB
+            if slots:
+                await thread_service.update_participant_slots(session_id, payload.from_email, slots)
             else:
-                freebusy_outcome = await tools.check_freebusy(participants=participant_pool, slot=calendar_slot)
-                reasoning_trace = f"{reasoning_trace} Tool: check_freebusy={freebusy_outcome.status}."
+                # Store empty list to mark as replied even without parsed slots
+                await thread_service.update_participant_slots(session_id, payload.from_email, [])
 
-                freebusy_results = freebusy_outcome.payload.get("results")
-                slot_is_free = bool(
-                    isinstance(freebusy_results, list)
-                    and freebusy_results
-                    and isinstance(freebusy_results[0], dict)
-                    and freebusy_results[0].get("is_free") is True
+            trace = f"Received availability from {payload.from_email} ({len(slots)} slots)."
+
+        # Check if everyone has now replied
+        if not pending:
+            collected = await thread_service.get_collected_slots(session_id)
+            logger.info("All %d participants replied. Collected: %s", len(all_p), collected)
+
+            # Filter out participants with no slots
+            valid = {p: s for p, s in collected.items() if s}
+
+            if len(valid) < 2:
+                # Not enough slot data — ask organizer
+                await tools.send_gmail_message(
+                    recipients=[session.organizer_email],
+                    subject=f"Need more availability details — {meeting_title}",
+                    body_text=(
+                        f"All participants have responded for '{meeting_title}', but I couldn't extract "
+                        f"specific time slots from some replies. Could you clarify the available times?\n\n"
+                        f"[calsync-ref:{session_id}]"
+                    ),
+                    thread_id="", session_id=session_id,
                 )
+                trace += " Insufficient slot data, asked organizer to clarify."
+            else:
+                # Compute overlap
+                overlapping = _compute_overlap(valid, duration_minutes=60)
+                logger.info("Overlap result: %s", overlapping)
 
-                if not slot_is_free:
-                    action = "SENT_AVAILABILITY_REQUEST"
-                    request_body = "The suggested slot appears busy for at least one participant. Please share alternatives."
-                    gmail_outcome = await tools.send_gmail_message(
-                        recipients=participant_pool,
-                        subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
-                        body_text=request_body,
-                        thread_id=None,
-                        session_id=session_id,
-                    )
-                    reasoning_trace = (
-                        f"{reasoning_trace} Tool: slot_conflicted. Tool: send_gmail_message={gmail_outcome.status}."
-                    )
+                if overlapping:
+                    # Check calendar availability for best slot
+                    best = overlapping[0]
+                    fb = await tools.check_freebusy(participants=all_p, slot=best)
+                    fb_results = fb.payload.get("results", [])
+                    slot_free = bool(fb_results and fb_results[0].get("is_free"))
+
+                    if slot_free:
+                        # BOOK IT
+                        cal = await tools.book_calendar(
+                            title=meeting_title,
+                            participants=all_p,
+                            slot=best,
+                            organizer_email=organizer,
+                            session_id=session_id,
+                        )
+                        if cal.status == "OK":
+                            session.status = "BOOKED"
+                            booked = cal.payload
+                            bslot = booked.get("booked_slot", best)
+                            meet_link = booked.get("meet_link", "")
+                            event_link = booked.get("event_link", "")
+                            start_str = _fmt_ist(str(bslot.get("start", "")))
+                            end_str = _fmt_ist(str(bslot.get("end", "")))
+
+                            confirm = (
+                                f"Great news! '{meeting_title}' has been scheduled!\n\n"
+                                f"📅 {start_str} – {end_str}\n"
+                                f"🎥 Google Meet: {meet_link or 'See calendar invite'}\n"
+                                f"📆 Calendar: {event_link or 'See calendar invite'}\n\n"
+                                "You'll receive a Google Calendar invite shortly.\n\nCalSync.ai"
+                            )
+                            for p in all_p:
+                                await tools.send_gmail_message(
+                                    recipients=[p],
+                                    subject=f"Meeting Confirmed: {meeting_title}",
+                                    body_text=confirm,
+                                    thread_id="", session_id=session_id,
+                                )
+                            trace += f" Booked at {start_str}. Confirmations sent to all."
+                        else:
+                            trace += " Booking API failed."
+                    else:
+                        # Calendar busy despite overlap — ask for more
+                        await _ask_for_more_slots(tools, all_p, session_id, meeting_title,
+                            "The best overlapping time is already blocked on the calendar.")
+                        session.status = "AWAITING_REPLIES"
+                        replied = []
+                        session.last_reminder_at = _now_iso()
+                        trace += " Calendar conflict on best slot. Asked for alternatives."
+
                 else:
-                    all_booking_participants = dedupe_emails(session.participants + participant_pool)
-                    all_booking_participants = exclude_emails(all_booking_participants, [settings.gmail_sender_email or ""])
-
-                    calendar_outcome = await tools.book_calendar(
-                        title=meeting_title,
-                        participants=all_booking_participants,
-                        slot=calendar_slot,
-                        organizer_email=session.organizer_email or payload.from_email,
-                        session_id=session_id,
+                    # NO OVERLAP — ask everyone for more slots
+                    collected_summary = "\n".join(
+                        f"• {p}: " + (", ".join(
+                            f"{_fmt_ist(s['start'])}–{_fmt_ist(s['end'])}" for s in slots
+                        ) if slots else "no clear times provided")
+                        for p, slots in collected.items()
                     )
-                    reasoning_trace = f"{reasoning_trace} Tool: book_calendar={calendar_outcome.status}."
-
-                    if calendar_outcome.status == "OK":
-                        session.status = "BOOKED"
-
-                    booked = calendar_outcome.payload
-                    meet_link = str(booked.get("meet_link") or "")
-                    event_link = str(booked.get("event_link") or "")
-                    booked_slot = booked.get("booked_slot", calendar_slot)
-
-                    try:
-                        ist = timezone(timedelta(hours=5, minutes=30))
-                        start_ist = datetime.fromisoformat(
-                            str(booked_slot.get("start", calendar_slot["start"])) .replace("Z", "+00:00")
-                        ).astimezone(ist).strftime("%d %b %Y, %I:%M %p IST")
-                        end_ist = datetime.fromisoformat(
-                            str(booked_slot.get("end", calendar_slot["end"])) .replace("Z", "+00:00")
-                        ).astimezone(ist).strftime("%I:%M %p IST")
-                        slot_display = f"{start_ist} - {end_ist}"
-                    except Exception:
-                        slot_display = f"{calendar_slot['start']} - {calendar_slot['end']} (UTC)"
-
-                    confirmation_body = (
-                        f"Great news! Your meeting '{meeting_title}' has been confirmed.\n\n"
-                        f"Time: {slot_display}\n"
-                        f"Google Meet: {meet_link or 'See calendar invite'}\n"
-                        f"Calendar: {event_link or 'See calendar invite'}\n\n"
-                        "You will receive a Google Calendar invite shortly."
+                    no_overlap_msg = (
+                        f"Hi,\n\nI wasn't able to find a common time for '{meeting_title}'.\n\n"
+                        f"Availability received:\n{collected_summary}\n\n"
+                        "Could everyone please share more available times? "
+                        "Even 30 minutes of flexibility would help!\n\nCalSync.ai\n\n"
+                        f"[calsync-ref:{session_id}]"
                     )
-                    gmail_outcome = await tools.send_gmail_message(
-                        recipients=all_booking_participants,
-                        subject=f"Meeting confirmed: {meeting_title}",
-                        body_text=confirmation_body,
-                        thread_id=None,
-                        session_id=session_id,
-                    )
-                    reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
+                    for p in all_p:
+                        await tools.send_gmail_message(
+                            recipients=[p],
+                            subject=f"More Availability Needed — {meeting_title}",
+                            body_text=no_overlap_msg,
+                            thread_id="", session_id=session_id,
+                        )
+                    # Reset so everyone must reply again
+                    replied = []
+                    session.last_reminder_at = _now_iso()
+                    session.status = "AWAITING_REPLIES"
+                    trace += " No overlap. Asked all for more availability."
 
-    if session.status != "BOOKED":
-        if pending_participants:
-            session.status = "AWAITING_REPLIES"
         else:
-            session.status = "READY_TO_COMPUTE"
+            # Some still pending — send reminder if cooldown passed
+            if _cooldown_ok(session.last_reminder_at, settings.reminder_cooldown_minutes):
+                replied_names = [r for r in replied if r.lower() != organizer]
+                replied_str = ", ".join(replied_names) if replied_names else "no one yet"
+                for p in pending:
+                    await tools.send_gmail_message(
+                        recipients=[p],
+                        subject=f"Reminder: Share your availability — {meeting_title}",
+                        body_text=(
+                            f"Hi,\n\nThis is a reminder to share your availability for '{meeting_title}'.\n\n"
+                            f"Already responded: {replied_str}\n\n"
+                            "Please reply with your available dates and times (IST).\n\nCalSync.ai\n\n"
+                            f"[calsync-ref:{session_id}]"
+                        ),
+                        thread_id="", session_id=session_id,
+                    )
+                session.last_reminder_at = _now_iso()
+                trace += f" Reminder sent to {pending}."
+            else:
+                trace += " Cooldown active. No reminder."
 
-    session.participants = participant_pool
-    session.replied_participants = replied_pool
-    if reminders_sent:
-        session.last_reminder_at = datetime.now(timezone.utc).isoformat()
+    # ── Persist ───────────────────────────────────────────────────────────────
+    if session.status != "BOOKED":
+        session.status = "AWAITING_REPLIES" if pending else "READY_TO_COMPUTE"
+    session.participants = all_p
+    session.replied_participants = replied
 
-    if settings.thread_intelligence_enabled:
-        try:
-            await thread_service.persist_state(session)
-        except Exception as exc:  # pragma: no cover - external dependency safety
-            logger.warning("Thread session persistence skipped: %s", exc)
+    try:
+        await thread_service.persist_state(session)
+    except Exception as exc:
+        logger.warning("Session persist failed: %s", exc)
 
-    return AgentProcessResponse(
-        agent_result=AgentResult(
-            action_taken=action,
-            session_id=session_id,
-            emails_sent_to=recipients,
-            reasoning_trace=reasoning_trace,
-        )
+    return AgentProcessResponse(agent_result=AgentResult(
+        action_taken=action_taken,
+        session_id=session_id,
+        emails_sent_to=inbound_people,
+        reasoning_trace=trace,
+    ))
+
+
+async def _ask_for_more_slots(
+    tools: CalsyncTools, participants: list, session_id: str, meeting_title: str, reason: str
+) -> None:
+    body = (
+        f"Hi,\n\n{reason}\n\n"
+        f"Could you please share additional available times for '{meeting_title}'?\n\nCalSync.ai\n\n"
+        f"[calsync-ref:{session_id}]"
     )
+    for p in participants:
+        await tools.send_gmail_message(
+            recipients=[p],
+            subject=f"Alternative Times Needed — {meeting_title}",
+            body_text=body,
+            thread_id="", session_id=session_id,
+        )

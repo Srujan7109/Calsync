@@ -12,7 +12,6 @@ from ingestion.app.services.background_tasks import process_email_task
 from ingestion.app.services.dedup_service import build_email_hash, check_and_mark_duplicate
 from ingestion.app.services.participant_utils import dedupe_emails, exclude_emails, parse_email_addresses
 
-
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -53,20 +52,15 @@ async def run_gmail_api_poller() -> None:
 
                     if await check_and_mark_duplicate(email_hash):
                         duplicates += 1
-                        await _mark_read(client, settings.gmail_mcp_url, gmail_message_id)
                         continue
 
                     text_lower = f"{subject} {body_text[:200]}".lower()
                     if not any(keyword in text_lower for keyword in settings.accepted_keywords):
                         filtered += 1
-                        await _mark_read(client, settings.gmail_mcp_url, gmail_message_id)
                         continue
 
-                    # Mark as read before queueing to reduce chance of duplicate pickup.
-                    await _mark_read(client, settings.gmail_mcp_url, gmail_message_id)
-
-                    to_raw = ", ".join(str(value) for value in message.get("to_emails", []))
-                    cc_raw = ", ".join(str(value) for value in message.get("cc_emails", []))
+                    to_raw = ", ".join(str(v) for v in message.get("to_emails", []))
+                    cc_raw = ", ".join(str(v) for v in message.get("cc_emails", []))
 
                     participants = exclude_emails(
                         dedupe_emails(
@@ -92,16 +86,12 @@ async def run_gmail_api_poller() -> None:
                     accepted += 1
                     logger.info("Gmail API poll queued from=%s subject=%s", from_email, subject)
 
-                if messages:
-                    logger.info(
-                        "Gmail API poll fetched=%s accepted=%s duplicates=%s filtered=%s",
-                        len(messages),
-                        accepted,
-                        duplicates,
-                        filtered,
-                    )
+                logger.info(
+                    "Gmail API poll fetched=%s accepted=%s duplicates=%s filtered=%s",
+                    len(messages), accepted, duplicates, filtered,
+                )
 
-        except Exception as exc:  # pragma: no cover - operational safety
+        except Exception as exc:
             logger.exception("Gmail API poller iteration failed: %s", exc)
 
         await asyncio.sleep(max(settings.imap_poll_interval_seconds, 1))

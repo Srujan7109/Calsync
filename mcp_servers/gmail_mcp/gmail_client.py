@@ -250,24 +250,18 @@ def get_message(message_id: str) -> dict:
 
 
 def list_unread_inbox(max_results: int = 20) -> list[dict]:
-    """
-    List and fetch unread INBOX messages via Gmail API.
-
-    Args:
-        max_results: Maximum unread messages to fetch.
-
-    Returns:
-        list[dict]: Parsed unread messages using get_message() shape.
-
-    Raises:
-        RuntimeError: On Gmail API failure.
-    """
+    """Fetch recent INBOX messages (last 24h) regardless of read status."""
     service = get_gmail_service()
     try:
         result = (
             service.users()
             .messages()
-            .list(userId="me", labelIds=["INBOX", "UNREAD"], maxResults=max_results)
+            .list(
+                userId="me",
+                labelIds=["INBOX"],
+                q="in:inbox newer_than:2d",          # last 24 hours, read OR unread
+                maxResults=max_results,
+            )
             .execute()
         )
         return [get_message(ref["id"]) for ref in result.get("messages", [])]
