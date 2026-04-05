@@ -313,6 +313,41 @@ def get_session_by_thread(thread_id: str) -> Optional[dict]:
         raise RuntimeError(f"get_session_by_thread failed: {exc}") from exc
 
 
+def ensure_session_exists(
+    session_id: Optional[str],
+    thread_id: str,
+    organizer_email: str,
+    meeting_title: str,
+) -> None:
+    """
+    Ensure a minimal `sessions` row exists for a provided session_id.
+
+    This prevents FK failures when writing `emails` / `activity_logs` rows that
+    reference a session created upstream in another service.
+    """
+    if not session_id:
+        return
+
+    now = _utcnow()
+    payload = {
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "status": "AWAITING_REPLIES",
+        "organizer_email": organizer_email,
+        "meeting_title": meeting_title or "Meeting",
+        "participants": [],
+        "replied_participants": [],
+        "last_reminder_at": None,
+        "collected_slots": {},
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        supabase.table("sessions").upsert(payload, on_conflict="session_id").execute()
+    except Exception as exc:
+        logger.warning("ensure_session_exists failed (non-fatal): %s", exc)
+
+
 # ── activity_logs table ──────────────────────────────────────────────────────
 
 

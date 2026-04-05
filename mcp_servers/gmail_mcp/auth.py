@@ -8,6 +8,7 @@ Run this file directly (python auth.py) once to generate the refresh token.
 
 import os
 import logging
+from typing import Optional
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -26,6 +27,11 @@ SCOPES = [
 ]
 
 TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+_CREDS_CACHE: Optional[Credentials] = None
+_GMAIL_SERVICE_CACHE = None
+_CALENDAR_SERVICE_CACHE = None
 
 
 def get_credentials() -> Credentials:
@@ -54,25 +60,28 @@ def get_credentials() -> Credentials:
             "Run `python auth.py` to generate them."
         )
 
-    creds = Credentials(
-        token=None,
-        refresh_token=settings.GOOGLE_REFRESH_TOKEN,
-        token_uri=TOKEN_URI,
-        client_id=settings.GOOGLE_CLIENT_ID,
-        client_secret=settings.GOOGLE_CLIENT_SECRET,
-        scopes=SCOPES,
-    )
+    global _CREDS_CACHE
+
+    if _CREDS_CACHE is None:
+        _CREDS_CACHE = Credentials(
+            token=None,
+            refresh_token=settings.GOOGLE_REFRESH_TOKEN,
+            token_uri=TOKEN_URI,
+            client_id=settings.GOOGLE_CLIENT_ID,
+            client_secret=settings.GOOGLE_CLIENT_SECRET,
+            scopes=SCOPES,
+        )
 
     # Refresh if expired (or token is None — first call)
-    if not creds.valid:
+    if not _CREDS_CACHE.valid:
         try:
-            creds.refresh(Request())
-            logger.info("Google credentials refreshed successfully.")
+            _CREDS_CACHE.refresh(Request())
+            logger.debug("Google credentials refreshed successfully.")
         except Exception as exc:
             logger.error("Failed to refresh Google credentials: %s", exc)
             raise RuntimeError(f"Credential refresh failed: {exc}") from exc
 
-    return creds
+    return _CREDS_CACHE
 
 
 def get_gmail_service():
@@ -85,8 +94,11 @@ def get_gmail_service():
     Raises:
         RuntimeError: If credentials cannot be obtained.
     """
-    creds = get_credentials()
-    return build("gmail", "v1", credentials=creds)
+    global _GMAIL_SERVICE_CACHE
+    if _GMAIL_SERVICE_CACHE is None:
+        creds = get_credentials()
+        _GMAIL_SERVICE_CACHE = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return _GMAIL_SERVICE_CACHE
 
 
 def get_calendar_service():
@@ -99,8 +111,11 @@ def get_calendar_service():
     Raises:
         RuntimeError: If credentials cannot be obtained.
     """
-    creds = get_credentials()
-    return build("calendar", "v3", credentials=creds)
+    global _CALENDAR_SERVICE_CACHE
+    if _CALENDAR_SERVICE_CACHE is None:
+        creds = get_credentials()
+        _CALENDAR_SERVICE_CACHE = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    return _CALENDAR_SERVICE_CACHE
 
 
 def run_initial_oauth_flow() -> None:

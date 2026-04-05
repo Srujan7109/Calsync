@@ -128,6 +128,19 @@ async def send_email(req: SendEmailRequest) -> Dict[str, Any]:
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
+    session_id_for_logs: Optional[str] = req.session_id
+    if req.session_id:
+        try:
+            supabase_ops.ensure_session_exists(
+                session_id=req.session_id,
+                thread_id=str(result.get("thread_id") or req.thread_id or ""),
+                organizer_email=settings.CALSYNC_EMAIL,
+                meeting_title=req.subject or "Meeting",
+            )
+        except Exception as exc:
+            logger.warning("send_email: session bootstrap failed, omitting session_id in logs: %s", exc)
+            session_id_for_logs = None
+
     # Build and store the OUTBOUND email record
     now = _utcnow()
     email_hash = hashlib.md5(
@@ -139,7 +152,7 @@ async def send_email(req: SendEmailRequest) -> Dict[str, Any]:
     record = EmailRecord(
         message_id=result["message_id"],
         thread_id=result["thread_id"],
-        session_id=req.session_id,
+        session_id=session_id_for_logs,
         direction="OUTBOUND",
         from_email=settings.CALSYNC_EMAIL,
         to_emails=req.to_emails,
@@ -163,7 +176,7 @@ async def send_email(req: SendEmailRequest) -> Dict[str, Any]:
 
     supabase_ops.write_activity_log(
         LogRequest(
-            session_id=req.session_id,
+            session_id=session_id_for_logs,
             event_type="EMAIL_SENT",
             severity="SUCCESS",
             description=f"Email sent to {req.to_emails}: '{req.subject}'",
