@@ -8,12 +8,15 @@ No external API calls — pure data construction utilities.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from uuid import uuid4
 
 from models import TimeSlot
 
 logger = logging.getLogger(__name__)
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 AI_DISCLAIMER = """
 
@@ -22,6 +25,19 @@ This meeting was autonomously coordinated by CalSync.ai,
 an AI-powered email scheduling assistant.
 To modify or cancel, reply to the original scheduling email.
 ---"""
+
+
+def _to_ist_iso(utc_iso: str) -> str:
+    """Convert a UTC ISO timestamp into an IST ISO timestamp."""
+    try:
+        normalized = utc_iso.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(IST).isoformat()
+    except (ValueError, AttributeError):
+        logger.warning("_to_ist_iso could not parse '%s'; using original", utc_iso)
+        return utc_iso
 
 
 def build_event_body(
@@ -59,10 +75,12 @@ def build_event_body(
         "summary": title,
         "description": full_description,
         "start": {
-            "dateTime": slot.start,
+            "dateTime": _to_ist_iso(slot.start),
+            "timeZone": "Asia/Kolkata",
         },
         "end": {
-            "dateTime": slot.end,
+            "dateTime": _to_ist_iso(slot.end),
+            "timeZone": "Asia/Kolkata",
         },
         "attendees": [{"email": p} for p in participants],
         "conferenceData": {

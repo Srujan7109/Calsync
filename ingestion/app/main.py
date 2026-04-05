@@ -8,6 +8,7 @@ from ingestion.app.config import get_settings
 from ingestion.app.routers.agent import router as agent_router
 from ingestion.app.routers.imap import router as imap_router
 from ingestion.app.routers.webhook import router as webhook_router
+from ingestion.app.services.gmail_api_poller import run_gmail_api_poller
 from ingestion.app.services.imap_poller import run_imap_poller
 
 
@@ -48,8 +49,12 @@ async def lifespan(_: FastAPI):
     logger.info("Lifespan startup: imap_auto_poll_enabled=%s", settings.imap_auto_poll_enabled)
 
     if settings.imap_auto_poll_enabled:
-        poller_task = asyncio.create_task(run_imap_poller())
-        logger.info("IMAP auto-poller task created")
+        if settings.use_gmail_api_polling:
+            poller_task = asyncio.create_task(run_gmail_api_poller())
+            logger.info("Gmail API poller task created")
+        else:
+            poller_task = asyncio.create_task(run_imap_poller())
+            logger.info("IMAP auto-poller task created")
 
     yield
 

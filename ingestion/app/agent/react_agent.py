@@ -263,14 +263,17 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
         if participant.lower() not in {email.lower() for email in replied_pool}
     ]
 
+    is_new_session = not session.replied_participants and session.last_reminder_at is None
+
     reminders_sent = False
 
     logger.info(
-        "Agent execution session_id=%s action=%s subject=%s recipients=%s",
+        "Agent execution session_id=%s action=%s subject=%s is_new=%s pending=%s",
         session_id,
         action,
         payload.subject,
-        len(recipients),
+        is_new_session,
+        len(pending_participants),
     )
 
     if action == "SENT_AVAILABILITY_REQUEST":
@@ -278,32 +281,39 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
             analysis.get("request_email_body")
             or "Thanks for reaching out. Please share your preferred time slot so I can coordinate the meeting."
         )
-        gmail_outcome = await tools.send_gmail_message(
-            recipients=participant_pool,
-            subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
-            body_text=request_body,
-            thread_id=thread_id,
-            session_id=session_id,
-        )
-        reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
 
-        # FIX 3: Only send reminders AFTER initial availability request has gone out
-        # and the cooldown has passed (session is already in AWAITING_REPLIES state)
+        send_to = participant_pool if is_new_session else (pending_participants or participant_pool)
+        send_thread_id = thread_id if is_new_session else None
+
+        if send_to:
+            gmail_outcome = await tools.send_gmail_message(
+                recipients=send_to,
+                subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
+                body_text=request_body,
+                thread_id=send_thread_id,
+                session_id=session_id,
+            )
+            reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."
+
+            if gmail_outcome.status == "OK" and is_new_session:
+                session.last_reminder_at = datetime.now(timezone.utc).isoformat()
+
         if (
             settings.thread_intelligence_enabled
+            and not is_new_session
             and session.status == "AWAITING_REPLIES"
             and pending_participants
             and _should_send_reminder(session.last_reminder_at, settings.reminder_cooldown_minutes)
         ):
             reminder_body = (
-                "Quick reminder: please reply with a time slot that works for you "
-                f"so we can finalize the meeting: {meeting_title}."
+                f"Quick reminder: we are still waiting on your availability to finalise '{meeting_title}'.\n\n"
+                "Please reply with specific dates and times (IST) that work for you."
             )
             reminder_outcome = await tools.send_gmail_message(
                 recipients=pending_participants,
                 subject=f"Reminder: availability needed for {meeting_title}",
                 body_text=reminder_body,
-                thread_id=thread_id,
+                thread_id=None,
                 session_id=session_id,
             )
             reminders_sent = reminder_outcome.status == "OK"
@@ -340,7 +350,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                 recipients=pending_participants,
                 subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
                 body_text=wait_body,
-                thread_id=thread_id,
+                thread_id=None,
                 session_id=session_id,
             )
             reasoning_trace = f"{reasoning_trace} Tool: waiting_for_participants={gmail_outcome.status}."
@@ -355,7 +365,7 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                     recipients=participant_pool,
                     subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
                     body_text=request_body,
-                    thread_id=thread_id,
+                    thread_id=None,
                     session_id=session_id,
                 )
                 reasoning_trace = (
@@ -380,18 +390,21 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                         recipients=participant_pool,
                         subject=f"Re: {payload.subject}" if payload.subject else "Meeting coordination",
                         body_text=request_body,
-                        thread_id=thread_id,
+                        thread_id=None,
                         session_id=session_id,
                     )
                     reasoning_trace = (
                         f"{reasoning_trace} Tool: slot_conflicted. Tool: send_gmail_message={gmail_outcome.status}."
                     )
                 else:
+                    all_booking_participants = dedupe_emails(session.participants + participant_pool)
+                    all_booking_participants = exclude_emails(all_booking_participants, [settings.gmail_sender_email or ""])
+
                     calendar_outcome = await tools.book_calendar(
                         title=meeting_title,
-                        participants=participant_pool,
+                        participants=all_booking_participants,
                         slot=calendar_slot,
-                        organizer_email=payload.from_email,
+                        organizer_email=session.organizer_email or payload.from_email,
                         session_id=session_id,
                     )
                     reasoning_trace = f"{reasoning_trace} Tool: book_calendar={calendar_outcome.status}."
@@ -399,15 +412,35 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
                     if calendar_outcome.status == "OK":
                         session.status = "BOOKED"
 
+                    booked = calendar_outcome.payload
+                    meet_link = str(booked.get("meet_link") or "")
+                    event_link = str(booked.get("event_link") or "")
+                    booked_slot = booked.get("booked_slot", calendar_slot)
+
+                    try:
+                        ist = timezone(timedelta(hours=5, minutes=30))
+                        start_ist = datetime.fromisoformat(
+                            str(booked_slot.get("start", calendar_slot["start"])) .replace("Z", "+00:00")
+                        ).astimezone(ist).strftime("%d %b %Y, %I:%M %p IST")
+                        end_ist = datetime.fromisoformat(
+                            str(booked_slot.get("end", calendar_slot["end"])) .replace("Z", "+00:00")
+                        ).astimezone(ist).strftime("%I:%M %p IST")
+                        slot_display = f"{start_ist} - {end_ist}"
+                    except Exception:
+                        slot_display = f"{calendar_slot['start']} - {calendar_slot['end']} (UTC)"
+
                     confirmation_body = (
-                        "Your meeting has been coordinated and added to the calendar. "
-                        f"Slot: {calendar_slot['start']} to {calendar_slot['end']} (UTC)."
+                        f"Great news! Your meeting '{meeting_title}' has been confirmed.\n\n"
+                        f"Time: {slot_display}\n"
+                        f"Google Meet: {meet_link or 'See calendar invite'}\n"
+                        f"Calendar: {event_link or 'See calendar invite'}\n\n"
+                        "You will receive a Google Calendar invite shortly."
                     )
                     gmail_outcome = await tools.send_gmail_message(
-                        recipients=participant_pool,
-                        subject=f"Calendar confirmed: {meeting_title}",
+                        recipients=all_booking_participants,
+                        subject=f"Meeting confirmed: {meeting_title}",
                         body_text=confirmation_body,
-                        thread_id=thread_id,
+                        thread_id=None,
                         session_id=session_id,
                     )
                     reasoning_trace = f"{reasoning_trace} Tool: send_gmail_message={gmail_outcome.status}."

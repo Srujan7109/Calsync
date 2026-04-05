@@ -249,6 +249,42 @@ def get_message(message_id: str) -> dict:
     }
 
 
+def list_unread_inbox(max_results: int = 20) -> list[dict]:
+    """
+    List and fetch unread INBOX messages via Gmail API.
+
+    Args:
+        max_results: Maximum unread messages to fetch.
+
+    Returns:
+        list[dict]: Parsed unread messages using get_message() shape.
+
+    Raises:
+        RuntimeError: On Gmail API failure.
+    """
+    service = get_gmail_service()
+    try:
+        result = (
+            service.users()
+            .messages()
+            .list(userId="me", labelIds=["INBOX", "UNREAD"], maxResults=max_results)
+            .execute()
+        )
+        return [get_message(ref["id"]) for ref in result.get("messages", [])]
+    except HttpError as exc:
+        logger.error("list_unread_inbox HttpError: %s", exc)
+        raise RuntimeError(f"Gmail list_unread_inbox failed: {exc}") from exc
+
+
+def mark_message_read(message_id: str) -> None:
+    """Remove the UNREAD label from a message."""
+    try:
+        mark_as_read(message_id)
+    except RuntimeError as exc:
+        logger.error("mark_message_read failed: %s", exc)
+        raise
+
+
 def get_thread(thread_id: str, max_messages: int = 50) -> List[dict]:
     """
     Fetch and parse all messages in a Gmail thread.

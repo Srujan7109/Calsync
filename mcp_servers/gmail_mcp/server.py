@@ -222,6 +222,32 @@ async def send_clarification(req: SendEmailRequest) -> Dict[str, Any]:
     return await send_email(req)
 
 
+@app.get("/messages/unread", tags=["Email"])
+async def list_unread_messages(limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Fetch unread INBOX messages via Gmail API.
+
+    Query:
+      - limit: maximum number of unread messages to return.
+    """
+    try:
+        return gmail_client.list_unread_inbox(limit)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/messages/{gmail_message_id}/mark-read", tags=["Email"])
+async def mark_message_read(
+    gmail_message_id: str = Path(..., description="Gmail message ID"),
+) -> Dict[str, str]:
+    """Mark a Gmail message as read so it is not reprocessed."""
+    try:
+        gmail_client.mark_message_read(gmail_message_id)
+        return {"status": "ok"}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # =============================================================================
 # THREAD INTELLIGENCE
 # =============================================================================

@@ -114,10 +114,10 @@ def fetch_emails(settings: Settings, limit: int = 20) -> list[ImapEmail]:
                 )
             )
 
-        try:
-            mail.store(uid, "+FLAGS", "\\Seen")
-        except Exception:
-            pass
+            try:
+                mail.store(uid, "+FLAGS", "\\Seen")
+            except Exception:
+                pass
 
         return emails
     finally:
