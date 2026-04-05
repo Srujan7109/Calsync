@@ -257,7 +257,8 @@ async def run_react_agent(payload: AgentProcessPayload) -> AgentProcessResponse:
     session_id = session.session_id
     is_new = not session.replied_participants and session.last_reminder_at is None
     all_p = exclude_emails(dedupe_emails(session.participants + inbound_people), [calsync])
-    replied = exclude_emails(dedupe_emails(session.replied_participants + [payload.from_email]), [calsync])
+    replied_seed = session.replied_participants if is_new else (session.replied_participants + [payload.from_email])
+    replied = exclude_emails(dedupe_emails(replied_seed), [calsync])
     replied_set = {e.lower() for e in replied}
     organizer = (session.organizer_email or payload.from_email).lower()
     pending = [p for p in all_p if p.lower() not in replied_set]
